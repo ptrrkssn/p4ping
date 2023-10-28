@@ -408,7 +408,8 @@ main(int argc,
     for (j = 1; argv[i][j]; j++) {
       switch (argv[i][j]) {
       case 'h':
-        printf("Usage:\n\t%s [<options>] <host>\n", argv[0]);
+        printf("Usage:\n  %s [<options>] <host> [..<host-N>]\n", argv[0]);
+        puts("\nOptions:");
         puts("  -h            Display this information");
         puts("  -v            Be more verbose");
         puts("  -s            Be silent");
