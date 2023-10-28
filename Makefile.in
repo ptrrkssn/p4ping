@@ -1,0 +1,124 @@
+# Makefile.in for p4ping
+#
+# @configure_input@
+
+
+# Some 'make' variants does not include CPPFLAGS when compiling, some do
+.c.o:
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+PACKAGE =		@PACKAGE_TARNAME@
+VERSION =		@PACKAGE_VERSION@
+
+srcdir =		@srcdir@
+VPATH =			@srcdir@
+
+DESTDIR =
+PREFIX =		@prefix@
+
+prefix =		${PREFIX}
+exec_prefix =		@exec_prefix@
+datarootdir =		@datarootdir@
+
+BINDIR =		@bindir@
+MANDIR =		@mandir@
+MAN1DIR =		${MANDIR}/man1
+
+PKG_CONFIG = 		@PKG_CONFIG@
+PKG_CONFIG_LIBDIR =	@PKG_CONFIG_LIBDIR@
+PKG_CONFIG_PATH =	@PKG_CONFIG_PATH@
+
+CPPFLAGS =		@CPPFLAGS@ -I. -I$(srcdir)
+CFLAGS =		@CFLAGS@ -Wall
+LDFLAGS =		@LDFLAGS@
+LIBS =			@LIBS@
+
+CC = 			@CC@
+INSTALL =		@INSTALL@
+TAR =			tar
+@SET_MAKE@
+
+VALGRIND =		valgrind
+VALGRINDFLAGS =		--leak-check=full --track-origins=yes --error-exitcode=1 # --show-leak-kinds=all
+
+DISTCHECKDIR =		/tmp/distcheck-$(PACKAGE)-$(VERSION)
+DISTDIR =		/tmp/build-$(PACKAGE)-$(VERSION)
+
+PROGRAMS =		p4ping
+OBJS =			p4ping.o
+
+
+
+all: $(PROGRAMS)
+
+p4ping.o:	p4ping.c Makefile config.h
+
+p4ping: $(OBJS)
+	$(CC) $(LDFLAGS) -o p4ping $(OBJS) $(LIBS)
+
+
+# Clean targets
+maintainer-clean:
+	$(MAKE) -f Makefile.dist distclean
+
+distclean:
+	$(MAKE) -f Makefile.dist distclean
+#	(cd pkgs && $(MAKE) -f Makefile.dist distclean)
+
+clean mostlyclean:
+	$(MAKE) -f Makefile.dist clean
+
+
+
+# Git targets
+push: 	distclean
+	git add -A && git commit -a && git push
+
+pull:
+	git pull
+
+
+# Install targets
+install install-all: install-bin install-aliases install-man
+
+install-strip: install-bin-strip install-aliases install-man
+
+install-bin: $(PROGRAMS)
+	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+	$(INSTALL) $(PROGRAMS) "$(DESTDIR)$(BINDIR)"
+
+install-bin-strip: $(PROGRAMS)
+	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+	$(INSTALL) -s $(PROGRAMS) "$(DESTDIR)$(BINDIR)"
+
+install-aliases:
+	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+
+install-man:  p4ping.man
+	$(INSTALL) -d "$(DESTDIR)$(MAN1DIR)"
+	$(INSTALL) -m 644 p4ping.man "$(DESTDIR)$(MAN1DIR)/p4ping.1"
+	if test -f /usr/share/man/man1/cat.1.gz; then \
+		gzip -f "$(DESTDIR)$(MAN1DIR)/p4ping.1" && \
+	fi
+
+uninstall:
+	for F in p4ping; do \
+		if test -f "$(DESTDIR)$(BINDIR)/$$F"; then rm "$(DESTDIR)$(BINDIR)/$$F"; fi; \
+	done
+	for F in p4ping.1 p4ping.1.gz; do \
+		if test -f "$(DESTDIR)$(MAN1DIR)/$$F"; then rm "$(DESTDIR)$(MAN1DIR)/$$F"; fi; \
+	done
+
+
+
+dist:	$(PACKAGE)-$(VERSION).tar.gz
+
+$(PACKAGE)-$(VERSION).tar.gz: p4ping
+	rm -fr "$(DISTDIR)" && mkdir -p "$(DISTDIR)/$(PACKAGE)-$(VERSION)" && \
+	  cp -r * "$(DISTDIR)/$(PACKAGE)-$(VERSION)" && \
+	  (cd "$(DISTDIR)/$(PACKAGE)-$(VERSION)" && $(MAKE) distclean)
+	(cd "$(DISTDIR)" && $(TAR) cvf - "$(PACKAGE)-$(VERSION)") | gzip >"$(PACKAGE)-$(VERSION)".tar.gz
+	echo rm -fr "$(DISTDIR)"
+	@echo ""
+	@echo "*** $(PACKAGE)-$(VERSION).tar.gz created"
+
