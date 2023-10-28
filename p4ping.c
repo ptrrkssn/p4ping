@@ -40,6 +40,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <syslog.h>
 #include <signal.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -65,7 +66,9 @@ int f_numeric = 0;
 int f_silent = 0;
 int f_ttl = 0;
 int f_display = 0;
-
+int f_warning = 1;
+int f_critical = 0;
+int f_syslog = -1;
 
 double
 diff_timespec(struct timespec *t0,
@@ -182,6 +185,35 @@ send_icmp_echo_request(struct target *tp,
 }
 
 int
+validate_icmp_echo_reply(struct target *tp,
+                         int seq,
+                         struct timespec *t,
+                         void *buf,
+                         size_t buflen) {
+  struct icmp_echo *er = (struct icmp_echo *) buf;
+
+
+  if (buflen != sizeof(*er) ||
+      er->type != (tp->ai->ai_protocol == IPPROTO_ICMP ? 0 : 129))
+    return 0; /* Not an ICMP Echo Reply Message */
+
+  if (er->code != 0)
+    return -1;
+
+  if (er->ident != 0)
+    return -2;
+
+  if (ntohs(er->seq) != seq) {
+    return -3;
+  }
+
+  if (strncmp(er->magic, ICMP_ECHO_MAGIC, ICMP_ECHO_MAGIC_LEN) != 0)
+    return -4;
+
+  return 1;
+}
+
+int
 send_ntp_request(struct target *tp,
                  int seq,
                  struct timespec *t) {
@@ -195,7 +227,7 @@ send_ntp_request(struct target *tp,
 
 struct dns_header {
   uint16_t id;
-  
+
   unsigned rd     : 1;
   unsigned tc     : 1;
   unsigned aa     : 1;
@@ -244,7 +276,10 @@ display_buffer(void *buf,
   int i;
 
   while (bufp < endp) {
-    putchar('\t');
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
     for (i = 0; i < 16 && bufp+i < endp; i++) {
       if (i > 0)
 	putchar(' ');
@@ -252,11 +287,16 @@ display_buffer(void *buf,
 	putchar(' ');
       printf("%02x", bufp[i]);
     }
-    while (i++ < 16) {
+    for (; i < 16; i++) {
+      if (i == 8)
+	putchar(' ');
       fputs("   ", stdout);
     }
 
-    putchar('\t');
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
     for (i = 0; i < 16 && bufp < endp; i++) {
       if (i > 0)
 	putchar(' ');
@@ -265,7 +305,7 @@ display_buffer(void *buf,
       putchar(isprint(*bufp) ? *bufp : '?');
       ++bufp;
     }
-    
+
     putchar('\n');
   }
 
@@ -283,7 +323,7 @@ struct protocol {
 } protocols[] = {
   { "icmp",
     SOCK_RAW, IPPROTO_ICMP, NULL,
-    NULL, send_icmp_echo_request, NULL },
+    NULL, send_icmp_echo_request, validate_icmp_echo_reply },
   { "ntp",
     SOCK_DGRAM, 0, "ntp",
     NULL, send_ntp_request, NULL },
@@ -298,10 +338,51 @@ struct protocol {
     NULL, NULL, NULL }
 };
 
+
+struct syslog_fac {
+  char *name;
+  int fac;
+} logfacv[] = {
+  { "auth", LOG_AUTH },
+  { "authpriv", LOG_AUTHPRIV },
+  { "cron", LOG_CRON },
+  { "daemon", LOG_DAEMON },
+  { "ftp", LOG_FTP },
+  { "local0", LOG_LOCAL0 },
+  { "local1", LOG_LOCAL1 },
+  { "local2", LOG_LOCAL2 },
+  { "local3", LOG_LOCAL3 },
+  { "local4", LOG_LOCAL4 },
+  { "local5", LOG_LOCAL5 },
+  { "local6", LOG_LOCAL6 },
+  { "local7", LOG_LOCAL7 },
+  { "lpr", LOG_LPR },
+  { "mail", LOG_MAIL },
+  { "news", LOG_NEWS },
+  { "user", LOG_USER },
+  { "uucp", LOG_UUCP },
+  { NULL, -1 }
+};
+
+int
+str2fac(const char *str,
+        int *fac) {
+  int i;
+
+  for (i = 0; logfacv[i].name && strcmp(logfacv[i].name, str) != 0; i++)
+    ;
+
+  if (fac)
+    *fac = logfacv[i].fac;
+
+  return logfacv[i].fac;
+}
+
+
 int
 main(int argc,
      char *argv[]) {
-  int rc, i, j, k, n, v, rlen;
+  int rc, i, j, k, v, rlen;
   unsigned int seq;
   unsigned char rbuf[9000];
   char hbuf[NI_MAXHOST];
@@ -346,8 +427,12 @@ main(int argc,
         puts(")");
         puts("  -I<time>      Interval between pings");
         puts("  -T<ttl>       Packet TTL");
+        puts("  -W<missed>    Warning level of missed packets");
+        puts("  -C<missed>    Critical level of missed packets");
         puts("  -S<service>   Force IP service (port) number");
+        puts("  -L<facility>  Enable syslog");
         exit(0);
+
       case '4':
         f_family = AF_INET;
         break;
@@ -396,6 +481,21 @@ main(int argc,
         }
         goto NextArg;
 
+      case 'L':
+        if (argv[i][j+1]) {
+          if ((rc = str2fac(argv[i]+j+1, &f_syslog)) >= 0)
+            goto NextArg;
+        } else if (i+1 < argc && argv[i+1][0] != '-') {
+          if ((rc = str2fac(argv[++j], &f_syslog)) >= 0)
+            goto NextArg;
+        }
+        if (rc < 0) {
+          fprintf(stderr, "%s: Error: -L: Missing or invalid syslog facility\n",
+                  argv[0]);
+          exit(1);
+        }
+        goto NextArg;
+
       case 'I':
         rc = 0;
         if (argv[i][j+1]) {
@@ -403,6 +503,38 @@ main(int argc,
             goto NextArg;
         } else if (i+1 < argc && argv[i+1][0] != '-') {
           if ((rc = sscanf(argv[++i], "%u", &f_interval)) == 1)
+            goto NextArg;
+        }
+        if (rc != 1) {
+          fprintf(stderr, "%s: Error: -I: Missing or invalid required argument\n",
+                  argv[0]);
+          exit(1);
+        }
+        goto NextArg;
+
+      case 'W':
+        rc = 0;
+        if (argv[i][j+1]) {
+          if ((rc = sscanf(argv[i]+j+1, "%u", &f_warning)) == 1)
+            goto NextArg;
+        } else if (i+1 < argc && argv[i+1][0] != '-') {
+          if ((rc = sscanf(argv[++i], "%u", &f_warning)) == 1)
+            goto NextArg;
+        }
+        if (rc != 1) {
+          fprintf(stderr, "%s: Error: -W: Missing or invalid required argument\n",
+                  argv[0]);
+          exit(1);
+        }
+        goto NextArg;
+
+      case 'C':
+        rc = 0;
+        if (argv[i][j+1]) {
+          if ((rc = sscanf(argv[i]+j+1, "%u", &f_critical)) == 1)
+            goto NextArg;
+        } else if (i+1 < argc && argv[i+1][0] != '-') {
+          if ((rc = sscanf(argv[++i], "%u", &f_critical)) == 1)
             goto NextArg;
         }
         if (rc != 1) {
@@ -443,12 +575,15 @@ main(int argc,
 
   if (f_verbose)
     printf("[p4ping, version %s - Copyright (c) 2023 Peter Eriksson <pen@lysator.liu.se>]\n", version);
-  
+
  EndArg:
   if (i >= argc) {
     fprintf(stderr, "%s: Error: Missing required <hosts> arguments\n", argv[0]);
     exit(1);
   }
+
+  if (f_syslog != -1)
+    openlog("p4ping", 0, f_syslog);
 
   for (j = 0; protocols[j].name && strcmp(protocols[j].name, f_protocol) != 0; j++)
     ;
@@ -479,22 +614,39 @@ main(int argc,
 
 
     for (rp = result; rp != NULL; rp = rp->ai_next) {
+      int fd = -1;
+
+
       if (rp->ai_family == AF_INET6 && pp->ai_protocol == IPPROTO_ICMP)
         rp->ai_protocol = IPPROTO_ICMPV6;
 
-      int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-      if (fd == -1) {
-        fprintf(stderr, "%s: Error: %s: socket: %s\n",
-                argv[0], argv[i], strerror(errno));
-        continue;
+      /* For ICMP & ICMPV6 we reuse previously allocated sockets */
+      if (rp->ai_protocol == IPPROTO_ICMP ||
+          rp->ai_protocol == IPPROTO_ICMPV6) {
+        for (tp = tlist; tp; tp = tp->next) {
+	  if (tp->ai->ai_protocol == rp->ai_protocol)
+	    break;
+	}
+        if (tp) {
+          fd = tp->fd;
+	}
       }
 
-      if (f_ttl) {
-        rc = setsockopt(fd, IPPROTO_IP, IP_TTL, &f_ttl, sizeof(f_ttl));
-        if (rc < 0) {
-          fprintf(stderr, "%s: Error: %s: setsockopt(IP_TTL): %s\n",
+      if (fd < 0) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd == -1) {
+          fprintf(stderr, "%s: Error: %s: socket: %s\n",
                   argv[0], argv[i], strerror(errno));
-          exit(1);
+          continue;
+        }
+
+        if (f_ttl) {
+          rc = setsockopt(fd, IPPROTO_IP, IP_TTL, &f_ttl, sizeof(f_ttl));
+          if (rc < 0) {
+            fprintf(stderr, "%s: Error: %s: setsockopt(IP_TTL): %s\n",
+                    argv[0], argv[i], strerror(errno));
+            exit(1);
+          }
         }
       }
 
@@ -518,6 +670,7 @@ main(int argc,
                 argv[0], argv[i], gai_strerror(rc));
         exit(1);
       }
+
       tp->addr = strdup(hbuf);
       v = strlen(tp->addr);
       if (v > addrlen)
@@ -546,7 +699,6 @@ main(int argc,
     }
   }
 
-
   if (!pfdn) {
     fprintf(stderr, "%s: Error: No IP addresses to ping!\n",
             argv[0]);
@@ -559,20 +711,22 @@ main(int argc,
     exit(1);
   }
 
+
   seq = 0;
   do {
+    int na;
+
+    
+    /* Setup response timeout */
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigalrm_handler;
     sigaction(SIGALRM, &sa, NULL);
-
     alarm(f_timeout);
     clock_gettime(CLOCK_REALTIME, &t0);
 
 
-    if (f_verbose > 1)
-      puts("Sending requests");
-
-    n = 0;
+    /* Transmit request packets to all targets */
+    na = 0;
     for (tp = tlist; tp; tp = tp->next) {
       rc = pp->request(tp, seq, &t0);
       if (rc < 0) {
@@ -582,29 +736,41 @@ main(int argc,
       }
 
       tp->t0 = t0;
-      n++;
+      ++na;
     }
 
-    while (n) {
-      n = 0;
+
+    /* Loop until all targets have replied, or we timeout */
+    while (na) {
+      int np;
+      
+      /* Build list of FDs to listen for packets on */
+      np = 0;
       for (tp = tlist; tp; tp = tp->next) {
+        int k;
+
+        /* FD already in use? */
+        for (k = 0; k < np && pfdv[k].fd != tp->fd; k++)
+          ;
+
         if (tp->t0.tv_sec) {
-          pfdv[n].fd = tp->fd;
-          pfdv[n].events = POLLIN;
-          pfdv[n].revents = 0;
-          n++;
+	  if (k == np) {
+	    pfdv[np].fd = tp->fd;
+	    pfdv[np].events = POLLIN;
+	    pfdv[np].revents = 0;
+	    ++np;
+	  }
         }
       }
 
-      if (f_verbose > 1)
-        printf("Waiting for %d responses:\n", n);
 
       clock_gettime(CLOCK_REALTIME, &t1);
       td = 1.0-diff_timespec(&t1, &t0);
       if (td < 0)
         td = 0;
 
-      rc = poll(&pfdv[0], n, td*1000);
+      /* For for response packets or alarm timeout */
+      rc = poll(&pfdv[0], np, td*1000);
       if (rc < 0) {
         if (errno == EINTR) {
           goto End;
@@ -616,95 +782,118 @@ main(int argc,
       } else if (rc == 0)
         goto End;
 
-      for (j = 0; j < n; j++) {
+      for (j = 0; j < np; j++) {
         if (pfdv[j].revents & POLLIN) {
-          for (tp = tlist; tp && tp->fd != pfdv[j].fd; tp = tp->next)
-            ;
-          if (!tp) {
-            fprintf(stderr, "%s: Error: Foo!\n", argv[0]);
-            exit(1);
-          }
-
+          /* Clear out response sender address */
           fromp = (struct sockaddr *) &frombuf;
           flen = sizeof(frombuf);
           memset(fromp, 0, flen);
 
           memset(rbuf, 0, sizeof(rbuf));
-          rc = recvfrom(tp->fd, rbuf, sizeof(rbuf), 0, fromp, &flen);
-          if (rc < 0) {
-            if (errno == EINTR) {
-              goto End;
-            } else {
-              fprintf(stderr, "%s: Error: %s [%s]: recvfrom: %s\n",
-                      argv[0], tp->addr, tp->name, strerror(errno));
-              exit(1);
-            }
-          }
-	  rlen = rc;
 
-          if (flen != tp->ai->ai_addrlen ||
-              memcmp(tp->ai->ai_addr, fromp, flen) != 0) {
-            rc = getnameinfo(fromp, flen,
-                             hbuf, sizeof(hbuf),
-                             NULL, 0, NI_NUMERICHOST);
-            /* XXX: Handle err from getnameinfo() */
-            fprintf(stderr, "%s: Error: %s: Spurious response (ignored)\n",
-                    argv[0], hbuf);
-	    if (f_display) {
-	      int offset = 0; /* (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0); */
-	      rc = display_buffer(rbuf+offset, rlen-offset);
+          /* Receive response */
+          rlen = rc = recvfrom(pfdv[j].fd, rbuf, sizeof(rbuf), 0, fromp, &flen);
+          if (rc < 0) {
+            if (errno == EINTR)
+              goto End;
+            fprintf(stderr, "%s: Error: recvfrom: %s\n",
+                    argv[0], strerror(errno));
+            exit(1);
+          }
+
+          /* Get printable IP address */
+          rc = getnameinfo(fromp, flen,
+                           hbuf, sizeof(hbuf),
+                           NULL, 0, NI_NUMERICHOST);
+          /* XXX: Handle err from getnameinfo() */
+
+          /* Locate response sender in list of targets */
+          for (tp = tlist; tp; tp = tp->next) {
+            if (flen == tp->ai->ai_addrlen && memcmp(tp->ai->ai_addr, fromp, flen) == 0) {
+              break;
 	    }
+          }
+
+          /* Unknown sender */
+          if (!tp) {
+            if (f_verbose > 1) {
+              fprintf(stderr, "%s: Error: %s: Spurious packet received (ignored)\n",
+                      argv[0], hbuf);
+              if (f_display) {
+                int offset = 0;
+                rc = display_buffer(rbuf+offset, rlen-offset);
+              }
+            }
             continue;
           }
 
 
+          /* Validate response */
           if (pp->response) {
-            rc = pp->response(tp, seq, &t1, rbuf, rlen);
+            int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
+
+            rc = pp->response(tp, seq, &t1, rbuf+offset, rlen-offset);
+            if (rc <= 0) {
+              if (rc < 0) {
+                fprintf(stderr, "%s: Error: %s: Invalid response: RC=%d\n",
+                        argv[0], hbuf, rc);
+                if (f_display)
+                  rc = display_buffer(rbuf+offset, rlen-offset);
+              }
+              continue;
+            }
 	  }
 
 
+          /* Print valid response */
           clock_gettime(CLOCK_REALTIME, &t1);
           tp->t1 = t1;
           rtt = diff_timespec(&t1, &t0);
-          print_timespec(&t1);
-          printf(" : %-*s : ", addrlen, tp->addr);
-          if (!f_numeric)
-            printf("%-*s : ", namelen, tp->name);
-          printf("seq=%u : rtt=%.3f ms", seq, rtt*1000);
-          if (f_verbose)
-            printf(" : len=%d : missed=%u", rc, tp->missed);
-          putchar('\n');
+          if (!f_silent) {
+	    int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
+	    
+            print_timespec(&t1);
+            printf(" : %-*s : ", addrlen, tp->addr);
+            if (!f_numeric)
+              printf("%-*s : ", namelen, tp->name);
+            printf("seq=%u : rtt=%.3f ms", seq, rtt*1000);
+            if (f_verbose)
+              printf(" : len=%d : missed=%u", rlen-offset, tp->missed);
+            putchar('\n');
+            if (f_display) {
+              rc = display_buffer(rbuf+offset, rlen-offset);
+            }
+          }
           tp->t0.tv_sec = 0;
           tp->missed = 0;
-          n--;
-
-	  if (f_display) {
-	    int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
-            rc = display_buffer(rbuf+offset, rlen-offset);
-	  }
+          --na;
         }
       }
     }
 
   End:
+    /* Disable timeout */
     alarm(0);
 
+    /* Get current time */
     clock_gettime(CLOCK_REALTIME, &t1);
-    if (rc < 0 && errno == EINTR) {
-      for (tp = tlist; tp; tp = tp->next) {
-        if (tp->t0.tv_sec) {
+
+    /* Print missed responses */
+    for (tp = tlist; tp; tp = tp->next) {
+      if (tp->t0.tv_sec) {
+        if (!f_silent || (tp->missed >= f_warning || tp->missed >= f_critical)) {
           print_timespec(&t1);
           printf(" : %-*s : ", addrlen, tp->addr);
           if (!f_numeric)
             printf("%-*s : ", namelen, tp->name);
-          printf("seq=%u : Timeout\n", seq);
-          tp->t0.tv_sec = 0;
-          tp->missed++;
-          n--;
+          printf("seq=%u : missed=%u : Timeout\n", seq, tp->missed);
         }
+        tp->t0.tv_sec = 0;
+        tp->missed++;
       }
     }
 
+    /* Sleep until next time */
     if (f_cont) {
       td = f_interval-diff_timespec(&t1, &t0);
       if (td > 0) {
@@ -714,6 +903,7 @@ main(int argc,
       }
     }
 
+    /* Increase sequence counter */
     seq++;
   } while (f_cont);
 }
