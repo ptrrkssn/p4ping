@@ -35,6 +35,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
@@ -47,7 +48,10 @@
 #include <poll.h>
 
 
+char *version = PACKAGE_VERSION;
+
 char *f_protocol = "icmp";
+char *f_service = NULL;
 
 int f_family = AF_UNSPEC;
 int f_timeout = 1;
@@ -60,6 +64,7 @@ int f_script = 0;
 int f_numeric = 0;
 int f_silent = 0;
 int f_ttl = 0;
+int f_display = 0;
 
 
 double
@@ -188,6 +193,84 @@ send_ntp_request(struct target *tp,
   return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 }
 
+struct dns_header {
+  uint16_t id;
+  
+  unsigned rd     : 1;
+  unsigned tc     : 1;
+  unsigned aa     : 1;
+  unsigned opcode : 4;
+  unsigned qr     : 1;
+
+  unsigned rcode  : 4;
+  unsigned z      : 3;
+  unsigned ra     : 1;
+
+  uint16_t qdcount;
+  uint16_t ancount;
+  uint16_t nscount;
+  uint16_t arcount;
+} __attribute__((packed));
+
+int
+send_dns_request(struct target *tp,
+                 int seq,
+                 struct timespec *t) {
+  struct dns_header req;
+
+  memset(&req, 0, sizeof(req));
+  req.id = htons(seq);
+  req.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
+
+  return sendto(tp->fd, (void *) &req, sizeof(req), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+int
+send_udp_request(struct target *tp,
+                 int seq,
+                 struct timespec *t) {
+  unsigned char tbuf[512];
+
+  memset(tbuf, 0, sizeof(tbuf));
+  return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+
+int
+display_buffer(void *buf,
+		 size_t buflen) {
+  unsigned char *bufp = (unsigned char *) buf;
+  unsigned char *endp = bufp+buflen;
+  int i;
+
+  while (bufp < endp) {
+    putchar('\t');
+    for (i = 0; i < 16 && bufp+i < endp; i++) {
+      if (i > 0)
+	putchar(' ');
+      if (i == 8)
+	putchar(' ');
+      printf("%02x", bufp[i]);
+    }
+    while (i++ < 16) {
+      fputs("   ", stdout);
+    }
+
+    putchar('\t');
+    for (i = 0; i < 16 && bufp < endp; i++) {
+      if (i > 0)
+	putchar(' ');
+      if (i == 8)
+	putchar(' ');
+      putchar(isprint(*bufp) ? *bufp : '?');
+      ++bufp;
+    }
+    
+    putchar('\n');
+  }
+
+  return 0;
+}
 
 struct protocol {
   char *name;
@@ -196,14 +279,20 @@ struct protocol {
   char *ai_service;
   int (*setup)(struct addrinfo *aip);
   int (*request)(struct target *tp, int seq, struct timespec *t0);
-  int (*response)(struct target *tp, int seq, struct timespec *t0);
+  int (*response)(struct target *tp, int seq, struct timespec *t0, void *buf, size_t buflen);
 } protocols[] = {
   { "icmp",
     SOCK_RAW, IPPROTO_ICMP, NULL,
     NULL, send_icmp_echo_request, NULL },
   { "ntp",
-    SOCK_DGRAM, 0, "123",
+    SOCK_DGRAM, 0, "ntp",
     NULL, send_ntp_request, NULL },
+  { "dns",
+    SOCK_DGRAM, 0, "domain",
+    NULL, send_dns_request, NULL },
+  { "udp",
+    SOCK_DGRAM, IPPROTO_UDP, "echo",
+    NULL, send_udp_request, NULL },
   { NULL,
     -1, -1,
     NULL, NULL, NULL }
@@ -212,7 +301,7 @@ struct protocol {
 int
 main(int argc,
      char *argv[]) {
-  int rc, i, j, n, v;
+  int rc, i, j, k, n, v, rlen;
   unsigned int seq;
   unsigned char rbuf[9000];
   char hbuf[NI_MAXHOST];
@@ -245,11 +334,19 @@ main(int argc,
         puts("  -c            Continous ping");
         puts("  -f            Flood ping");
         puts("  -n            No DNS lookup");
+        puts("  -d            Display response packet");
         puts("  -4            Force IPv4");
         puts("  -6            Force IPv6");
-        puts("  -P<protocol>  Type of protocol (icmp|ntp)");
+        printf("  -P<protocol>  Type of protocol (");
+        for (k = 0; protocols[k].name; k++) {
+          if (k > 0)
+            putchar('|');
+          fputs(protocols[k].name, stdout);
+        }
+        puts(")");
         puts("  -I<time>      Interval between pings");
         puts("  -T<ttl>       Packet TTL");
+        puts("  -S<service>   Force IP service (port) number");
         exit(0);
       case '4':
         f_family = AF_INET;
@@ -272,6 +369,9 @@ main(int argc,
       case 'n':
         f_numeric++;
         break;
+      case 'd':
+        f_display++;
+        break;
       case 'P':
         if (argv[i][j+1])
           f_protocol = argv[i]+j+1;
@@ -279,6 +379,18 @@ main(int argc,
           f_protocol = argv[++i];
         else {
           fprintf(stderr, "%s: Error: -P: Missing required argument\n",
+                  argv[0]);
+          exit(1);
+        }
+        goto NextArg;
+
+      case 'S':
+        if (argv[i][j+1])
+          f_service = argv[i]+j+1;
+        else if (i+1 < argc && argv[i+1][0] != '-')
+          f_service = argv[++i];
+        else {
+          fprintf(stderr, "%s: Error: -S: Missing required argument\n",
                   argv[0]);
           exit(1);
         }
@@ -329,6 +441,9 @@ main(int argc,
   NextArg:;
   }
 
+  if (f_verbose)
+    printf("[p4ping, version %s - Copyright (c) 2023 Peter Eriksson <pen@lysator.liu.se>]\n", version);
+  
  EndArg:
   if (i >= argc) {
     fprintf(stderr, "%s: Error: Missing required <hosts> arguments\n", argv[0]);
@@ -355,7 +470,7 @@ main(int argc,
     hints.ai_addr = NULL;
     hints.ai_next = NULL;
 
-    rc = getaddrinfo(argv[i], pp->ai_service, &hints, &result);
+    rc = getaddrinfo(argv[i], (f_service ? f_service : pp->ai_service), &hints, &result);
     if (rc != 0) {
       fprintf(stderr, "%s: Error: %s: getaddrinfo: %s\n",
               argv[0], argv[i], gai_strerror(rc));
@@ -525,7 +640,7 @@ main(int argc,
               exit(1);
             }
           }
-
+	  rlen = rc;
 
           if (flen != tp->ai->ai_addrlen ||
               memcmp(tp->ai->ai_addr, fromp, flen) != 0) {
@@ -535,8 +650,17 @@ main(int argc,
             /* XXX: Handle err from getnameinfo() */
             fprintf(stderr, "%s: Error: %s: Spurious response (ignored)\n",
                     argv[0], hbuf);
+	    if (f_display) {
+	      int offset = 0; /* (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0); */
+	      rc = display_buffer(rbuf+offset, rlen-offset);
+	    }
             continue;
           }
+
+
+          if (pp->response) {
+            rc = pp->response(tp, seq, &t1, rbuf, rlen);
+	  }
 
 
           clock_gettime(CLOCK_REALTIME, &t1);
@@ -553,6 +677,11 @@ main(int argc,
           tp->t0.tv_sec = 0;
           tp->missed = 0;
           n--;
+
+	  if (f_display) {
+	    int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
+            rc = display_buffer(rbuf+offset, rlen-offset);
+	  }
         }
       }
     }
