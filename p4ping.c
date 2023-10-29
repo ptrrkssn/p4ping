@@ -35,6 +35,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
@@ -61,6 +62,7 @@ int f_tcp = 0;
 int f_cont = 0;
 int f_ndelay = 0;
 int f_verbose = 0;
+int f_ignore = 0;
 int f_script = 0;
 int f_numeric = 0;
 int f_silent = 0;
@@ -69,6 +71,9 @@ int f_display = 0;
 int f_warning = 1;
 int f_critical = 0;
 int f_syslog = -1;
+
+uint16_t f_ident = 0;
+char *payload = "[p4ping]";
 
 double
 diff_timespec(struct timespec *t0,
@@ -106,6 +111,51 @@ sigalrm_handler(int sig) {
 }
 
 
+int
+display_buffer(void *buf,
+		 size_t buflen) {
+  unsigned char *bufp = (unsigned char *) buf;
+  unsigned char *endp = bufp+buflen;
+  int i;
+
+  while (bufp < endp) {
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
+    for (i = 0; i < 16 && bufp+i < endp; i++) {
+      if (i > 0)
+	putchar(' ');
+      if (i == 8)
+	putchar(' ');
+      printf("%02x", bufp[i]);
+    }
+    for (; i < 16; i++) {
+      if (i == 8)
+	putchar(' ');
+      fputs("   ", stdout);
+    }
+
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
+    putchar(' ');
+    for (i = 0; i < 16 && bufp < endp; i++) {
+      if (i > 0)
+	putchar(' ');
+      if (i == 8)
+	putchar(' ');
+      putchar(isprint(*bufp) ? *bufp : '?');
+      ++bufp;
+    }
+
+    putchar('\n');
+  }
+
+  return 0;
+}
+
+
 
 typedef struct target {
   int fd;
@@ -122,17 +172,20 @@ TARGET *tlist = NULL;
 
 
 
-#define ICMP_ECHO_MAGIC "1234567890"
-#define ICMP_ECHO_MAGIC_LEN 11
 
-struct icmp_echo {
+struct icmp_echo_header {
   uint8_t type;
   uint8_t code;
   uint16_t checksum;
   uint16_t ident;
   uint16_t seq;
-  double ts;
-  char magic[ICMP_ECHO_MAGIC_LEN];
+};
+
+#define MAXBUFSIZE 16384
+
+struct icmp_echo {
+  struct icmp_echo_header header;
+  uint8_t payload[MAXBUFSIZE];
 };
 
 
@@ -170,18 +223,25 @@ send_icmp_echo_request(struct target *tp,
                        int seq,
                        struct timespec *t) {
   struct icmp_echo ep;
-  short ident = 0;
+  size_t plen, eplen;
+
+
+  plen = strlen(payload);
+  eplen = sizeof(struct icmp_echo_header)+plen;
 
   memset(&ep, 0, sizeof(ep));
-  ep.type = (tp->ai->ai_family == AF_INET ? 8 : 128);
-  ep.code = 0;
-  ep.ident = htons(ident);
-  ep.seq = htons(seq);
-  strncpy(ep.magic, ICMP_ECHO_MAGIC, ICMP_ECHO_MAGIC_LEN);
-  ep.ts = t->tv_sec+(t->tv_nsec/1000000000.0);
-  ep.checksum = htons(calc_checksum((unsigned char *) &ep, sizeof(ep)));
+  ep.header.type = (tp->ai->ai_family == AF_INET ? 8 : 128);
+  ep.header.code = 0;
+  ep.header.ident = htons(f_ident);
+  ep.header.seq = htons(seq);
 
-  return sendto(tp->fd, &ep, sizeof(ep), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+  memcpy(ep.payload, payload, plen);
+
+  /* The kernel automatically calculates the checksum for ICMPV6 */
+  if (tp->ai->ai_protocol == IPPROTO_ICMP)
+    ep.header.checksum = htons(calc_checksum((unsigned char *) &ep, eplen));
+
+  return sendto(tp->fd, &ep, eplen, 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 }
 
 int
@@ -191,26 +251,38 @@ validate_icmp_echo_reply(struct target *tp,
                          void *buf,
                          size_t buflen) {
   struct icmp_echo *er = (struct icmp_echo *) buf;
+  uint16_t checksum;
+  size_t erlen = sizeof(struct icmp_echo_header)+strlen(payload);
 
 
-  if (buflen != sizeof(*er) ||
-      er->type != (tp->ai->ai_protocol == IPPROTO_ICMP ? 0 : 129))
-    return 0; /* Not an ICMP Echo Reply Message */
-
-  if (er->code != 0)
+  if (buflen < sizeof(struct icmp_echo_header))
     return -1;
 
-  if (er->ident != 0)
-    return -2;
+  if (er->header.type != (tp->ai->ai_protocol == IPPROTO_ICMP ? 0 : 129))
+    return -1; /* Not an ICMP Echo Reply Message */
 
-  if (ntohs(er->seq) != seq) {
-    return -3;
+  if (buflen != erlen)
+    return -2; /* Invalid packet length */
+
+  /* Only validate the checksum for IPv4 */
+  if (tp->ai->ai_protocol == IPPROTO_ICMP) {
+    checksum = ntohs(er->header.checksum);
+    er->header.checksum = 0;
+    if (checksum != calc_checksum((unsigned char *) er, erlen)) {
+      return -3; /* Invalid checksum */
+    }
   }
 
-  if (strncmp(er->magic, ICMP_ECHO_MAGIC, ICMP_ECHO_MAGIC_LEN) != 0)
-    return -4;
+  if (ntohs(er->header.ident) != f_ident)
+    return -4; /* Invalid ident - not a response to our request */
 
-  return 1;
+  if (ntohs(er->header.seq) != seq)
+    return -5; /* Sequence number out of order */
+
+  if (memcmp(er->payload, payload, strlen(payload)) != 0)
+    return -6; /* Invalid payload content */
+
+  return er->header.code;
 }
 
 int
@@ -267,50 +339,6 @@ send_udp_request(struct target *tp,
   return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 }
 
-
-int
-display_buffer(void *buf,
-		 size_t buflen) {
-  unsigned char *bufp = (unsigned char *) buf;
-  unsigned char *endp = bufp+buflen;
-  int i;
-
-  while (bufp < endp) {
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
-    for (i = 0; i < 16 && bufp+i < endp; i++) {
-      if (i > 0)
-	putchar(' ');
-      if (i == 8)
-	putchar(' ');
-      printf("%02x", bufp[i]);
-    }
-    for (; i < 16; i++) {
-      if (i == 8)
-	putchar(' ');
-      fputs("   ", stdout);
-    }
-
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
-    for (i = 0; i < 16 && bufp < endp; i++) {
-      if (i > 0)
-	putchar(' ');
-      if (i == 8)
-	putchar(' ');
-      putchar(isprint(*bufp) ? *bufp : '?');
-      ++bufp;
-    }
-
-    putchar('\n');
-  }
-
-  return 0;
-}
 
 struct protocol {
   char *name;
@@ -384,7 +412,7 @@ main(int argc,
      char *argv[]) {
   int rc, i, j, k, v, rlen;
   unsigned int seq;
-  unsigned char rbuf[9000];
+  unsigned char rbuf[MAXBUFSIZE+1024];
   char hbuf[NI_MAXHOST];
   double td, rtt;
   struct timespec t0, t1;
@@ -404,6 +432,9 @@ main(int argc,
   struct protocol *pp;
 
 
+  srandom(time(NULL)^getpid());
+  f_ident = random();
+
   for (i = 1; i < argc && argv[i][0] == '-'; i++) {
     for (j = 1; argv[i][j]; j++) {
       switch (argv[i][j]) {
@@ -413,6 +444,7 @@ main(int argc,
         puts("  -h            Display this information");
         puts("  -v            Be more verbose");
         puts("  -s            Be silent");
+        puts("  -i            Ignore checksum errors");
         puts("  -c            Continous ping");
         puts("  -f            Flood ping");
         puts("  -n            No DNS lookup");
@@ -442,6 +474,9 @@ main(int argc,
         break;
       case 'v':
         f_verbose++;
+        break;
+      case 'i':
+        f_ignore++;
         break;
       case 's':
         f_silent++;
@@ -641,10 +676,22 @@ main(int argc,
           continue;
         }
 
+#if 0
+        if (rp->ai_protocol == IPPROTO_ICMPV6) {
+          int offset = offsetof(struct icmp_echo_header, checksum);
+          rc = setsockopt(fd, SOL_RAW, IPV6_CHECKSUM, &offset, sizeof(offset));
+          if (rc < 0) {
+            fprintf(stderr, "%s: Error: %s: setsockopt(SOL_RAW, IPV6_CHECKSUM): %s\n",
+                    argv[0], argv[i], strerror(errno));
+            exit(1);
+          }
+        }
+#endif
+
         if (f_ttl) {
           rc = setsockopt(fd, IPPROTO_IP, IP_TTL, &f_ttl, sizeof(f_ttl));
           if (rc < 0) {
-            fprintf(stderr, "%s: Error: %s: setsockopt(IP_TTL): %s\n",
+            fprintf(stderr, "%s: Error: %s: setsockopt(IPPROTO_IP, IP_TTL): %s\n",
                     argv[0], argv[i], strerror(errno));
             exit(1);
           }
@@ -834,7 +881,7 @@ main(int argc,
             int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
 
             rc = pp->response(tp, seq, &t1, rbuf+offset, rlen-offset);
-            if (rc <= 0) {
+            if (rc) {
               if (rc < 0) {
                 fprintf(stderr, "%s: Error: %s: Invalid response: RC=%d\n",
                         argv[0], hbuf, rc);
@@ -852,7 +899,7 @@ main(int argc,
           rtt = diff_timespec(&t1, &t0);
           if (!f_silent) {
 	    int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
-	    
+
             print_timespec(&t1);
             printf(" : %-*s : ", addrlen, tp->addr);
             if (!f_numeric)
