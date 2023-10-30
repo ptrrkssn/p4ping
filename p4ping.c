@@ -59,9 +59,10 @@ int f_family = AF_UNSPEC;
 int f_timeout = 1;
 int f_interval = 1;
 int f_tcp = 0;
-int f_cont = 0;
+int f_cont = 3;
 int f_ndelay = 0;
 int f_verbose = 0;
+int f_summary = 0;
 int f_ignore = 0;
 int f_script = 0;
 int f_numeric = 0;
@@ -164,7 +165,15 @@ typedef struct target {
   struct addrinfo *ai;
   struct timespec t0;
   struct timespec t1;
-  unsigned int missed;
+  struct {
+    unsigned long sent;
+    unsigned long missed;
+  } packets;
+  struct {
+    double min;
+    double max;
+    double sum;
+  } rtt;
   struct target *next;
 } TARGET;
 
@@ -259,28 +268,28 @@ validate_icmp_echo_reply(struct target *tp,
     return -1;
 
   if (er->header.type != (tp->ai->ai_protocol == IPPROTO_ICMP ? 0 : 129))
-    return -1; /* Not an ICMP Echo Reply Message */
+    return -2; /* Not an ICMP Echo Reply Message */
 
   if (buflen != erlen)
-    return -2; /* Invalid packet length */
+    return -3; /* Invalid packet length */
 
   /* Only validate the checksum for IPv4 */
   if (tp->ai->ai_protocol == IPPROTO_ICMP) {
     checksum = ntohs(er->header.checksum);
     er->header.checksum = 0;
     if (checksum != calc_checksum((unsigned char *) er, erlen)) {
-      return -3; /* Invalid checksum */
+      return -4; /* Invalid checksum */
     }
   }
 
   if (ntohs(er->header.ident) != f_ident)
-    return -4; /* Invalid ident - not a response to our request */
+    return -5; /* Invalid ident - not a response to our request */
 
   if (ntohs(er->header.seq) != seq)
-    return -5; /* Sequence number out of order */
+    return -6; /* Sequence number out of order */
 
   if (memcmp(er->payload, payload, strlen(payload)) != 0)
-    return -6; /* Invalid payload content */
+    return -7; /* Invalid payload content */
 
   return er->header.code;
 }
@@ -481,9 +490,11 @@ main(int argc,
       case 's':
         f_silent++;
         break;
-      case 'c':
-        f_cont++;
+      case '1':
+        f_cont = 1;
         break;
+      case 'c':
+        f_cont = -1;
       case 'f':
         f_ndelay++;
         break;
@@ -741,6 +752,10 @@ main(int argc,
           namelen = v;
       }
 
+      tp->rtt.min = -1;
+      tp->rtt.max = 0;
+      tp->rtt.sum = 0;
+      
       pfdn++;
       tp->next = tlist;
       tlist = tp;
@@ -760,22 +775,24 @@ main(int argc,
   }
 
 
-  seq = 0;
+  seq = 1;
   do {
     int na;
 
-    
+
     /* Setup response timeout */
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigalrm_handler;
     sigaction(SIGALRM, &sa, NULL);
     alarm(f_timeout);
-    clock_gettime(CLOCK_REALTIME, &t0);
 
+    clock_gettime(CLOCK_REALTIME, &t0);
 
     /* Transmit request packets to all targets */
     na = 0;
     for (tp = tlist; tp; tp = tp->next) {
+      clock_gettime(CLOCK_REALTIME, &tp->t0);
+
       rc = pp->request(tp, seq, &t0);
       if (rc < 0) {
         fprintf(stderr, "%s: Error: %s [%s]: send-request: %s\n",
@@ -783,7 +800,9 @@ main(int argc,
         exit(1);
       }
 
-      tp->t0 = t0;
+      tp->t1.tv_sec = 0;
+      tp->t1.tv_nsec = 0;
+      tp->packets.sent++;
       ++na;
     }
 
@@ -791,7 +810,7 @@ main(int argc,
     /* Loop until all targets have replied, or we timeout */
     while (na) {
       int np;
-      
+
       /* Build list of FDs to listen for packets on */
       np = 0;
       for (tp = tlist; tp; tp = tp->next) {
@@ -801,7 +820,7 @@ main(int argc,
         for (k = 0; k < np && pfdv[k].fd != tp->fd; k++)
           ;
 
-        if (tp->t0.tv_sec) {
+        if (tp->t1.tv_sec == 0 && tp->t1.tv_nsec == 0) {
 	  if (k == np) {
 	    pfdv[np].fd = tp->fd;
 	    pfdv[np].events = POLLIN;
@@ -812,12 +831,13 @@ main(int argc,
       }
 
 
+      /* Calculate how long to sleep max */
       clock_gettime(CLOCK_REALTIME, &t1);
-      td = 1.0-diff_timespec(&t1, &t0);
+      td = f_timeout-diff_timespec(&t1, &t0);
       if (td < 0)
         td = 0;
 
-      /* For for response packets or alarm timeout */
+      /* Wait for response packets or alarm timeout */
       rc = poll(&pfdv[0], np, td*1000);
       if (rc < 0) {
         if (errno == EINTR) {
@@ -849,11 +869,14 @@ main(int argc,
             exit(1);
           }
 
+          clock_gettime(CLOCK_REALTIME, &t1);
+
           /* Get printable IP address */
           rc = getnameinfo(fromp, flen,
                            hbuf, sizeof(hbuf),
                            NULL, 0, NI_NUMERICHOST);
           /* XXX: Handle err from getnameinfo() */
+
 
           /* Locate response sender in list of targets */
           for (tp = tlist; tp; tp = tp->next) {
@@ -882,7 +905,7 @@ main(int argc,
 
             rc = pp->response(tp, seq, &t1, rbuf+offset, rlen-offset);
             if (rc) {
-              if (rc < 0) {
+              if (f_verbose > 1) {
                 fprintf(stderr, "%s: Error: %s: Invalid response: RC=%d\n",
                         argv[0], hbuf, rc);
                 if (f_display)
@@ -893,10 +916,15 @@ main(int argc,
 	  }
 
 
-          /* Print valid response */
-          clock_gettime(CLOCK_REALTIME, &t1);
           tp->t1 = t1;
-          rtt = diff_timespec(&t1, &t0);
+          rtt = diff_timespec(&tp->t1, &tp->t0);
+          if (tp->rtt.min < 0 || rtt < tp->rtt.min)
+            tp->rtt.min = rtt;
+          if (rtt > tp->rtt.max)
+            tp->rtt.max = rtt;
+          tp->rtt.sum += rtt;
+
+          /* Print valid response */
           if (!f_silent) {
 	    int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
 
@@ -906,14 +934,13 @@ main(int argc,
               printf("%-*s : ", namelen, tp->name);
             printf("seq=%u : rtt=%.3f ms", seq, rtt*1000);
             if (f_verbose)
-              printf(" : len=%d : missed=%u", rlen-offset, tp->missed);
+              printf(" : len=%d : missed=%lu", rlen-offset, tp->packets.missed);
             putchar('\n');
             if (f_display) {
               rc = display_buffer(rbuf+offset, rlen-offset);
             }
           }
-          tp->t0.tv_sec = 0;
-          tp->missed = 0;
+          tp->packets.missed = 0;
           --na;
         }
       }
@@ -928,21 +955,21 @@ main(int argc,
 
     /* Print missed responses */
     for (tp = tlist; tp; tp = tp->next) {
-      if (tp->t0.tv_sec) {
-        if (!f_silent || (tp->missed >= f_warning || tp->missed >= f_critical)) {
+      if (tp->t1.tv_sec == 0 && tp->t1.tv_nsec == 0) {
+        if (!f_silent || (tp->packets.missed >= f_warning ||
+                          tp->packets.missed >= f_critical)) {
           print_timespec(&t1);
           printf(" : %-*s : ", addrlen, tp->addr);
           if (!f_numeric)
             printf("%-*s : ", namelen, tp->name);
-          printf("seq=%u : missed=%u : Timeout\n", seq, tp->missed);
+          printf("seq=%u : missed=%lu : Timeout\n", seq, tp->packets.missed);
         }
-        tp->t0.tv_sec = 0;
-        tp->missed++;
+        tp->packets.missed++;
       }
     }
 
     /* Sleep until next time */
-    if (f_cont) {
+    if (f_cont > 1) {
       td = f_interval-diff_timespec(&t1, &t0);
       if (td > 0) {
         if (f_verbose > 1)
@@ -952,6 +979,34 @@ main(int argc,
     }
 
     /* Increase sequence counter */
-    seq++;
-  } while (f_cont);
+    ++seq;
+  } while (f_cont < 0 || (f_cont && --f_cont));
+
+  if (f_summary || f_verbose) {
+    unsigned long sent = 0;
+    unsigned long missed = 0;
+    double rtt_min = -1;
+    double rtt_avg = 0;
+    double rtt_max = 0;
+    int nt = 0;
+
+    for (tp = tlist; tp; tp = tp->next) {
+      sent   += tp->packets.sent;
+      missed += tp->packets.missed;
+
+      if (rtt_min < 0 || tp->rtt.min < rtt_min)
+        rtt_min = tp->rtt.min;
+      if (tp->rtt.max > rtt_max)
+        rtt_max = tp->rtt.max;
+      rtt_avg += tp->rtt.sum;
+      ++nt;
+    }
+
+    rtt_avg /= (sent-missed);
+
+    printf("[packets: %lu sent, %lu received, %.0f%% packet loss; ",
+           sent, sent-missed, (missed*1.0/sent));
+    printf("rtt(ms): %.3f min, %.3f avg, %.3f max]\n",
+           rtt_min*1000.0, rtt_avg*1000.0, rtt_max*1000.0);
+  }
 }
