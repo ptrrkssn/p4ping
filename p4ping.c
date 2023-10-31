@@ -48,6 +48,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdatomic.h>
 
 
 char *version = PACKAGE_VERSION;
@@ -74,7 +75,10 @@ int f_critical = 0;
 int f_syslog = -1;
 
 uint16_t f_ident = 0;
-char *payload = "[p4ping]";
+char *f_payload = "[p4ping]";
+
+atomic_char got_sigint = 0;
+
 
 double
 diff_timespec(struct timespec *t0,
@@ -106,6 +110,11 @@ print_timespec(struct timespec *ts) {
   return fputs(buf, stdout);
 }
 
+
+void
+sigint_handler(int sig) {
+  got_sigint = 1;
+}
 
 void
 sigalrm_handler(int sig) {
@@ -235,7 +244,7 @@ send_icmp_echo_request(struct target *tp,
   size_t plen, eplen;
 
 
-  plen = strlen(payload);
+  plen = strlen(f_payload);
   eplen = sizeof(struct icmp_echo_header)+plen;
 
   memset(&ep, 0, sizeof(ep));
@@ -244,7 +253,7 @@ send_icmp_echo_request(struct target *tp,
   ep.header.ident = htons(f_ident);
   ep.header.seq = htons(seq);
 
-  memcpy(ep.payload, payload, plen);
+  memcpy(ep.payload, f_payload, plen);
 
   /* The kernel automatically calculates the checksum for ICMPV6 */
   if (tp->ai->ai_protocol == IPPROTO_ICMP)
@@ -261,7 +270,7 @@ validate_icmp_echo_reply(struct target *tp,
                          size_t buflen) {
   struct icmp_echo *er = (struct icmp_echo *) buf;
   uint16_t checksum;
-  size_t erlen = sizeof(struct icmp_echo_header)+strlen(payload);
+  size_t erlen = sizeof(struct icmp_echo_header)+strlen(f_payload);
 
 
   if (buflen < sizeof(struct icmp_echo_header))
@@ -288,7 +297,7 @@ validate_icmp_echo_reply(struct target *tp,
   if (ntohs(er->header.seq) != seq)
     return -6; /* Sequence number out of order */
 
-  if (memcmp(er->payload, payload, strlen(payload)) != 0)
+  if (memcmp(er->payload, f_payload, strlen(f_payload)) != 0)
     return -7; /* Invalid payload content */
 
   return er->header.code;
@@ -454,6 +463,7 @@ main(int argc,
         puts("  -v            Be more verbose");
         puts("  -s            Be silent");
         puts("  -i            Ignore checksum errors");
+        puts("  -1            One-shot ping");
         puts("  -c            Continous ping");
         puts("  -f            Flood ping");
         puts("  -n            No DNS lookup");
@@ -473,6 +483,7 @@ main(int argc,
         puts("  -C<missed>    Critical level of missed packets");
         puts("  -S<service>   Force IP service (port) number");
         puts("  -L<facility>  Enable syslog");
+        puts("  -D<data>      Payload data");
         exit(0);
 
       case '4':
@@ -538,6 +549,18 @@ main(int argc,
         }
         if (rc < 0) {
           fprintf(stderr, "%s: Error: -L: Missing or invalid syslog facility\n",
+                  argv[0]);
+          exit(1);
+        }
+        goto NextArg;
+
+      case 'D':
+        if (argv[i][j+1])
+          f_payload = argv[i]+j+1;
+        else if (i+1 < argc && argv[i+1][0] != '-')
+          f_payload = argv[++i];
+        else {
+          fprintf(stderr, "%s: Error: -S: Missing required argument\n",
                   argv[0]);
           exit(1);
         }
@@ -775,6 +798,11 @@ main(int argc,
   }
 
 
+    /* Setup response timeout */
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = sigint_handler;
+  sigaction(SIGINT, &sa, NULL);
+
   seq = 1;
   do {
     int na;
@@ -836,6 +864,9 @@ main(int argc,
       td = f_timeout-diff_timespec(&t1, &t0);
       if (td < 0)
         td = 0;
+
+      if (f_verbose > 1)
+        printf("Polling for %f ms\n", td*1000);
 
       /* Wait for response packets or alarm timeout */
       rc = poll(&pfdv[0], np, td*1000);
@@ -969,7 +1000,10 @@ main(int argc,
     }
 
     /* Sleep until next time */
-    if (f_cont > 1) {
+    if (f_cont < 0 || (f_cont && --f_cont)) {
+      /* Get current time */
+      clock_gettime(CLOCK_REALTIME, &t1);
+
       td = f_interval-diff_timespec(&t1, &t0);
       if (td > 0) {
         if (f_verbose > 1)
@@ -980,7 +1014,7 @@ main(int argc,
 
     /* Increase sequence counter */
     ++seq;
-  } while (f_cont < 0 || (f_cont && --f_cont));
+  } while (!got_sigint && f_cont);
 
   if (f_summary || f_verbose) {
     unsigned long sent = 0;
