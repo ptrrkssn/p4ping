@@ -11,7 +11,7 @@ AC_PROG_INSTALL
 AC_PROG_MAKE_SET
 
 # Checks for header files.
-AC_CHECK_HEADERS([arpa/inet.h stdint.h stdlib.h string.h sys/time.h unistd.h])
+AC_CHECK_HEADERS([arpa/inet.h stdint.h stdlib.h string.h sys/time.h unistd.h linux/icmp.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_TYPE_SIZE_T

@@ -50,6 +50,13 @@
 #include <poll.h>
 #include <stdatomic.h>
 
+#ifdef HAVE_LINUX_ICMP_H
+#include <linux/icmp.h>
+#else
+#include <netinet/ip_icmp.h>
+#endif
+#include <netinet/icmp6.h>
+
 
 char *version = PACKAGE_VERSION;
 
@@ -238,20 +245,20 @@ calc_checksum(unsigned char *buf,
 
 int
 send_icmp_echo_request(struct target *tp,
-                       int seq,
-                       struct timespec *t) {
+                       unsigned int *seq) {
   struct icmp_echo ep;
   size_t plen, eplen;
+  uint16_t xs = (*seq & 0xFFFF);
 
-
+  *seq = xs;
   plen = strlen(f_payload);
   eplen = sizeof(struct icmp_echo_header)+plen;
 
   memset(&ep, 0, sizeof(ep));
-  ep.header.type = (tp->ai->ai_family == AF_INET ? 8 : 128);
+  ep.header.type = (tp->ai->ai_family == AF_INET ? ICMP_ECHO : ICMP6_ECHO_REQUEST);
   ep.header.code = 0;
   ep.header.ident = htons(f_ident);
-  ep.header.seq = htons(seq);
+  ep.header.seq = htons(xs);
 
   memcpy(ep.payload, f_payload, plen);
 
@@ -264,7 +271,7 @@ send_icmp_echo_request(struct target *tp,
 
 int
 validate_icmp_echo_reply(struct target *tp,
-                         int seq,
+                         unsigned int seq,
                          struct timespec *t,
                          void *buf,
                          size_t buflen) {
@@ -276,7 +283,7 @@ validate_icmp_echo_reply(struct target *tp,
   if (buflen < sizeof(struct icmp_echo_header))
     return -1;
 
-  if (er->header.type != (tp->ai->ai_protocol == IPPROTO_ICMP ? 0 : 129))
+  if (er->header.type != (tp->ai->ai_protocol == IPPROTO_ICMP ? ICMP_ECHOREPLY : ICMP6_ECHO_REPLY))
     return -2; /* Not an ICMP Echo Reply Message */
 
   if (buflen != erlen)
@@ -294,7 +301,7 @@ validate_icmp_echo_reply(struct target *tp,
   if (ntohs(er->header.ident) != f_ident)
     return -5; /* Invalid ident - not a response to our request */
 
-  if (ntohs(er->header.seq) != seq)
+  if (ntohs(er->header.seq) != (seq & 0xFFFF))
     return -6; /* Sequence number out of order */
 
   if (memcmp(er->payload, f_payload, strlen(f_payload)) != 0)
@@ -305,8 +312,7 @@ validate_icmp_echo_reply(struct target *tp,
 
 int
 send_ntp_request(struct target *tp,
-                 int seq,
-                 struct timespec *t) {
+                 unsigned int *seq) {
   unsigned char tbuf[48];
 
   memset(tbuf, 0, sizeof(tbuf));
@@ -336,12 +342,13 @@ struct dns_header {
 
 int
 send_dns_request(struct target *tp,
-                 int seq,
-                 struct timespec *t) {
+                 unsigned int *seq) {
   struct dns_header req;
+  uint16_t xs = (*seq & 0xFFFF);
 
+  *seq = xs;
   memset(&req, 0, sizeof(req));
-  req.id = htons(seq);
+  req.id = htons(xs);
   req.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
 
   return sendto(tp->fd, (void *) &req, sizeof(req), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
@@ -349,8 +356,7 @@ send_dns_request(struct target *tp,
 
 int
 send_udp_request(struct target *tp,
-                 int seq,
-                 struct timespec *t) {
+                 unsigned int *seq) {
   unsigned char tbuf[512];
 
   memset(tbuf, 0, sizeof(tbuf));
@@ -364,8 +370,8 @@ struct protocol {
   int ai_protocol;
   char *ai_service;
   int (*setup)(struct addrinfo *aip);
-  int (*request)(struct target *tp, int seq, struct timespec *t0);
-  int (*response)(struct target *tp, int seq, struct timespec *t0, void *buf, size_t buflen);
+  int (*request)(struct target *tp, unsigned int *seq);
+  int (*response)(struct target *tp, unsigned int seq, struct timespec *t0, void *buf, size_t buflen);
 } protocols[] = {
   { "icmp",
     SOCK_RAW, IPPROTO_ICMP, NULL,
@@ -704,12 +710,37 @@ main(int argc,
 
       if (fd < 0) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == -1) {
+        if (fd < 0) {
           fprintf(stderr, "%s: Error: %s: socket: %s\n",
                   argv[0], argv[i], strerror(errno));
           continue;
         }
 
+#ifdef ICMP_FILTER
+        if (rp->ai_protocol == IPPROTO_ICMP) {
+          struct icmp_filter ifb;
+
+          ifb.data = ICMP_ECHOREPLY;
+          rc = setsockopt(fd, SOL_RAW, ICMP_FILTER, &ifb, sizeof(ifb));
+          if (fd < 0) {
+            fprintf(stderr, "%s: Notice: %s: setsockopt(ICMP_FILTER): %s [ignored]\n",
+                    argv[0], argv[i], strerror(errno));
+          }
+        }
+#endif
+#ifdef ICMP6_FILTER
+        if (rp->ai_protocol == IPPROTO_ICMPV6) {
+          struct icmp6_filter ifb;
+
+          ICMP6_FILTER_SETBLOCKALL(&ifb);
+          ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &ifb);
+          rc = setsockopt(fd, IPPROTO_ICMPV6, ICMP6_FILTER, &ifb, sizeof(ifb));
+          if (fd < 0) {
+            fprintf(stderr, "%s: Notice: %s: setsockopt(ICMP_FILTER): %s [ignored]\n",
+                    argv[0], argv[i], strerror(errno));
+          }
+        }
+#endif
 #if 0
         if (rp->ai_protocol == IPPROTO_ICMPV6) {
           int offset = offsetof(struct icmp_echo_header, checksum);
@@ -803,7 +834,7 @@ main(int argc,
   sa.sa_handler = sigint_handler;
   sigaction(SIGINT, &sa, NULL);
 
-  seq = 1;
+  seq = 0;
   do {
     int na;
 
@@ -821,7 +852,7 @@ main(int argc,
     for (tp = tlist; tp; tp = tp->next) {
       clock_gettime(CLOCK_REALTIME, &tp->t0);
 
-      rc = pp->request(tp, seq, &t0);
+      rc = pp->request(tp, &seq);
       if (rc < 0) {
         fprintf(stderr, "%s: Error: %s [%s]: send-request: %s\n",
                 argv[0], tp->addr, tp->name, strerror(errno));
@@ -865,7 +896,7 @@ main(int argc,
       if (td < 0)
         td = 0;
 
-      if (f_verbose > 1)
+      if (f_verbose > 2)
         printf("Polling for %f ms\n", td*1000);
 
       /* Wait for response packets or alarm timeout */
@@ -1006,7 +1037,7 @@ main(int argc,
 
       td = f_interval-diff_timespec(&t1, &t0);
       if (td > 0) {
-        if (f_verbose > 1)
+        if (f_verbose > 2)
           printf("Sleeping %f ms\n", td*1000);
         usleep(td*1000000);
       }
