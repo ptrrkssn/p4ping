@@ -1,7 +1,7 @@
 /*
  * p4ping.c
  *
- * Copyright (c) 2023 Peter Eriksson <pen@lysator.liu.se>
+ * Copyright (c) 2023-2024 Peter Eriksson <pen@lysator.liu.se>
  *
  * All rights reserved.
  *
@@ -108,9 +108,12 @@ print_timespec(struct timespec *ts) {
   rc = strftime(buf, len, "%F %T", &t);
   if (rc <= 0)
     return -1;
-  len -= rc - 1;
 
-  rc = snprintf(buf+strlen(buf), len, (f_verbose ? ".%09ld" : ".%03ld"), f_verbose ? ts->tv_nsec : ts->tv_nsec/1000000);
+  len -= rc;
+
+  rc = snprintf(buf+strlen(buf), len,
+                (f_verbose ? ".%09ld" : ".%03ld"),
+                f_verbose ? ts->tv_nsec : ts->tv_nsec/1000000);
   if (rc >= len)
     return -1;
 
@@ -546,6 +549,7 @@ main(int argc,
         goto NextArg;
 
       case 'L':
+        rc = -1;
         if (argv[i][j+1]) {
           if ((rc = str2fac(argv[i]+j+1, &f_syslog)) >= 0)
             goto NextArg;
@@ -650,7 +654,7 @@ main(int argc,
   }
 
   if (f_verbose)
-    printf("[p4ping, version %s - Copyright (c) 2023 Peter Eriksson <pen@lysator.liu.se>]\n", version);
+    printf("[p4ping, version %s - Copyright (c) 2023-2024 Peter Eriksson <pen@lysator.liu.se>]\n", version);
 
  EndArg:
   if (i >= argc) {
@@ -809,7 +813,7 @@ main(int argc,
       tp->rtt.min = -1;
       tp->rtt.max = 0;
       tp->rtt.sum = 0;
-      
+
       pfdn++;
       tp->next = tlist;
       tlist = tp;
