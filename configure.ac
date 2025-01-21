@@ -1,5 +1,5 @@
 AC_PREREQ([2.71])
-AC_INIT([p4ping],[1.0.1],[pen@lysator.liu.se],[p4ping],[https://github.com/ptrrkssn/p4ping])
+AC_INIT([p4ping],[1.0.2],[pen@lysator.liu.se],[p4ping],[https://github.com/ptrrkssn/p4ping])
 AC_CONFIG_AUX_DIR([build-aux])
 
 AC_CONFIG_SRCDIR([p4ping.c])

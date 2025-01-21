@@ -1,7 +1,7 @@
 /*
  * p4ping.c
  *
- * Copyright (c) 2023-2024 Peter Eriksson <pen@lysator.liu.se>
+ * Copyright (c) 2023-2025 Peter Eriksson <pen@lysator.liu.se>
  *
  * All rights reserved.
  *
@@ -59,6 +59,7 @@
 
 
 char *version = PACKAGE_VERSION;
+char *argv0 = "p4ping";
 
 char *f_protocol = "icmp";
 char *f_service = NULL;
@@ -68,7 +69,6 @@ int f_timeout = 1;
 int f_interval = 1;
 int f_tcp = 0;
 int f_cont = 3;
-int f_ndelay = 0;
 int f_verbose = 0;
 int f_summary = 0;
 int f_ignore = 0;
@@ -82,7 +82,8 @@ int f_critical = 0;
 int f_syslog = -1;
 
 uint16_t f_ident = 0;
-char *f_payload = "[p4ping]";
+char *f_payload = NULL;
+char *d_payload = "[p4ping]";
 
 atomic_char got_sigint = 0;
 
@@ -94,7 +95,8 @@ diff_timespec(struct timespec *t0,
 }
 
 int
-print_timespec(struct timespec *ts) {
+print_timespec(FILE *fp,
+	       struct timespec *ts) {
   char buf[64];
   int rc;
   struct tm t;
@@ -117,7 +119,7 @@ print_timespec(struct timespec *ts) {
   if (rc >= len)
     return -1;
 
-  return fputs(buf, stdout);
+  return fputs(buf, fp);
 }
 
 
@@ -132,44 +134,45 @@ sigalrm_handler(int sig) {
 
 
 int
-display_buffer(void *buf,
-		 size_t buflen) {
+display_buffer(FILE *outfp,
+	       void *buf,
+	       size_t buflen) {
   unsigned char *bufp = (unsigned char *) buf;
   unsigned char *endp = bufp+buflen;
   int i;
 
   while (bufp < endp) {
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
+    putc(' ', outfp);
+    putc(' ', outfp);
+    putc(' ', outfp);
+    putc(' ', outfp);
     for (i = 0; i < 16 && bufp+i < endp; i++) {
       if (i > 0)
-	putchar(' ');
+	putc(' ', outfp);
       if (i == 8)
-	putchar(' ');
-      printf("%02x", bufp[i]);
+	putc(' ', outfp);
+      fprintf(outfp, "%02x", bufp[i]);
     }
     for (; i < 16; i++) {
       if (i == 8)
-	putchar(' ');
-      fputs("   ", stdout);
+	putc(' ', outfp);
+      fputs("   ", outfp);
     }
 
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
-    putchar(' ');
+    putc(' ', outfp);
+    putc(' ', outfp);
+    putc(' ', outfp);
+    putc(' ', outfp);
     for (i = 0; i < 16 && bufp < endp; i++) {
       if (i > 0)
-	putchar(' ');
+	putc(' ', outfp);
       if (i == 8)
-	putchar(' ');
-      putchar(isprint(*bufp) ? *bufp : '?');
+	putc(' ', outfp);
+      putc(isprint(*bufp) ? *bufp : '?', outfp);
       ++bufp;
     }
 
-    putchar('\n');
+    putc('\n', outfp);
   }
 
   return 0;
@@ -252,9 +255,11 @@ send_icmp_echo_request(struct target *tp,
   struct icmp_echo ep;
   size_t plen, eplen;
   uint16_t xs = (*seq & 0xFFFF);
+  char *payload = f_payload ? f_payload : d_payload;
+
 
   *seq = xs;
-  plen = strlen(f_payload);
+  plen = strlen(payload);
   eplen = sizeof(struct icmp_echo_header)+plen;
 
   memset(&ep, 0, sizeof(ep));
@@ -263,7 +268,7 @@ send_icmp_echo_request(struct target *tp,
   ep.header.ident = htons(f_ident);
   ep.header.seq = htons(xs);
 
-  memcpy(ep.payload, f_payload, plen);
+  memcpy(ep.payload, payload, plen);
 
   /* The kernel automatically calculates the checksum for ICMPV6 */
   if (tp->ai->ai_protocol == IPPROTO_ICMP)
@@ -280,7 +285,8 @@ validate_icmp_echo_reply(struct target *tp,
                          size_t buflen) {
   struct icmp_echo *er = (struct icmp_echo *) buf;
   uint16_t checksum;
-  size_t erlen = sizeof(struct icmp_echo_header)+strlen(f_payload);
+  char *payload = f_payload ? f_payload : d_payload;
+  size_t erlen = sizeof(struct icmp_echo_header)+strlen(payload);
 
 
   if (buflen < sizeof(struct icmp_echo_header))
@@ -307,7 +313,7 @@ validate_icmp_echo_reply(struct target *tp,
   if (ntohs(er->header.seq) != (seq & 0xFFFF))
     return -6; /* Sequence number out of order */
 
-  if (memcmp(er->payload, f_payload, strlen(f_payload)) != 0)
+  if (memcmp(er->payload, payload, strlen(payload)) != 0)
     return -7; /* Invalid payload content */
 
   return er->header.code;
@@ -322,6 +328,32 @@ send_ntp_request(struct target *tp,
   tbuf[0] = 0x1B;
 
   return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+int
+send_udp_echo_request(struct target *tp,
+                  unsigned int *seq) {
+    unsigned int tbuf = htonl(*seq);
+
+  return sendto(tp->fd, &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+int
+validate_udp_echo_reply(struct target *tp,
+                        unsigned int seq,
+                        struct timespec *t,
+                        void *buf,
+                        size_t buflen) {
+    unsigned int rseq;
+
+    if (buflen != sizeof(rseq))
+        return -1;
+
+    rseq = ntohl(*(unsigned int *)buf);
+    if (rseq != seq)
+        return -6;
+
+    return 0;
 }
 
 struct dns_header {
@@ -343,18 +375,228 @@ struct dns_header {
   uint16_t arcount;
 } __attribute__((packed));
 
+
+struct dns_request {
+    struct dns_header h;
+    unsigned char b[16384];
+} __attribute__ ((packed));
+
+struct dns_reply {
+    struct dns_header h;
+    unsigned char b[];
+} __attribute__ ((packed));
+
+
+size_t
+dns_pack_labels(char *name,
+                unsigned char *buf,
+                size_t bufsize) {
+  char *cp;
+  size_t tlen, plen;
+
+  plen = 0;
+  while (*name) {
+    cp = strchr(name, '.');
+    tlen = cp ? cp-name : strlen(name);
+    if (tlen > 255)
+      return -1;
+
+    if (plen+1+tlen > bufsize)
+      return -1;
+
+    buf[plen++] = tlen;
+    memcpy(buf+plen, name, tlen);
+    plen += tlen;
+
+    name += tlen + (cp ? 1 : 0);
+  }
+
+  if (plen+1 > bufsize)
+    return -1;
+  buf[plen++] = 0;
+
+  return plen;
+}
+
+
+int
+dns_get_uint16(void *buf,
+	       size_t off) {
+  unsigned char *bufp = (unsigned char *) buf;
+  uint16_t rv;
+
+  rv = * (uint16_t *) (bufp+off);
+  return rv;
+}
+
+int
+dns_get_uint32(void *buf,
+	       size_t off) {
+  unsigned char *bufp = (unsigned char *) buf;
+  uint32_t rv;
+
+  rv = * (uint32_t *) (bufp+off);
+  return rv;
+}
+
+
+size_t
+dns_unpack_labels(unsigned char *buf,
+		  size_t pos,
+		  char *label,
+		  size_t size) {
+  unsigned char *bufp;
+  size_t len;
+
+
+  bufp = buf+pos;
+  while ((len = *bufp++) > 0) {
+    if (len >= 64) {
+      len &= 63;
+      len <<= 8;
+      len += *bufp++;
+      dns_unpack_labels(buf, len, label, size);
+      return bufp-buf;
+    } else {
+      while (len-- > 0) {
+	if (size <= 0)
+	  return -1;
+
+	*label++ = *bufp++;
+	--size;
+      }
+    }
+
+    if (size <= 0)
+      return -1;
+
+    *label++ = '.';
+    --size;
+  }
+
+  if (size <= 0)
+    return -1;
+
+  *label = '\0';
+
+  return bufp-buf;
+}
+
 int
 send_dns_request(struct target *tp,
                  unsigned int *seq) {
-  struct dns_header req;
+  struct dns_request req;
   uint16_t xs = (*seq & 0xFFFF);
+  size_t len;
+
 
   *seq = xs;
   memset(&req, 0, sizeof(req));
-  req.id = htons(xs);
-  req.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
+  req.h.id = htons((xs+getpid()*10)&0xFFFF);
+  req.h.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
 
-  return sendto(tp->fd, (void *) &req, sizeof(req), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+  if (f_payload) {
+    unsigned char *bufp;
+
+    len = dns_pack_labels(f_payload, req.b, sizeof(req.b));
+    if (len < 0) {
+      fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
+	      argv0, f_payload);
+      exit(1);
+    }
+    bufp = (unsigned char *) &req.b;
+    bufp[len++] = 0;
+    bufp[len++] = 1;
+    bufp[len++] = 0;
+    bufp[len++] = 1;
+
+    req.h.qdcount = htons(1);
+
+  } else
+      len = 0;
+
+  return sendto(tp->fd, (void *) &req, sizeof(req.h)+len, 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+
+int
+validate_dns_reply(struct target *tp,
+                   unsigned int seq,
+                   struct timespec *t,
+                   void *buf,
+                   size_t buflen) {
+  struct dns_reply *rep = (struct dns_reply *) buf;
+  unsigned int rseq, anc, qdc;
+  size_t pos;
+
+
+  if (buflen < sizeof(*rep))
+    return -1;
+
+  rseq = ntohs(rep->h.id);
+  if (rseq != ((seq+getpid()*10) & 0xFFFF))
+    return -1; /* Invalid sequence number */
+
+  qdc = ntohs(rep->h.qdcount);
+  if (qdc != (f_payload ? 1 : 0)) {
+    return -2; /* Invalid question count */
+  }
+
+  anc = ntohs(rep->h.ancount);
+  if ((anc != 0) != (f_payload ? 1 : 0)) {
+    return 3; /* Invalid answer count */
+  }
+
+  pos = sizeof(rep->h);
+  while (qdc-- > 0) {
+    char label[256];
+
+    pos = dns_unpack_labels((unsigned char *) rep, pos, label, sizeof(label));
+    if (f_verbose > 1)
+      printf("%s\tType=%d", label, htons(dns_get_uint16(rep, pos)));
+    pos += 2;
+    if (f_verbose > 1)
+      printf("\tClass=%d", htons(dns_get_uint16(rep, pos)));
+    pos += 2;
+    if (f_verbose > 1)
+      putchar('\n');
+  }
+
+  while (anc-- > 0) {
+    size_t rdlen;
+    struct in_addr in;
+    char label[256];
+
+    pos = dns_unpack_labels((unsigned char *) rep, pos, label, sizeof(label));
+    if (f_verbose)
+      printf("%s\tType=%d", label, htons(dns_get_uint16(rep, pos)));
+    pos += 2;
+    if (f_verbose)
+      printf("\tClass=%d", htons(dns_get_uint16(rep, pos)));
+    pos += 2;
+    if (f_verbose)
+      printf("\tTTL=%d", htonl(dns_get_uint32(rep, pos)));
+    pos += 4;
+    rdlen = htons(dns_get_uint16(rep, pos));
+    pos += 2;
+
+    if (f_verbose) {
+      if (rdlen == 4) {
+	char buf[256];
+	in.s_addr = dns_get_uint32(rep, pos);
+	inet_ntop(AF_INET, &in, buf, sizeof(buf));
+	printf("\t%s", buf);
+      } else {
+	printf("\t%s", "???");
+      }
+    }
+
+    pos += rdlen;
+    if (f_verbose)
+      putchar('\n');
+  }
+
+  return 0;
 }
 
 int
@@ -382,11 +624,17 @@ struct protocol {
   { "ntp",
     SOCK_DGRAM, 0, "ntp",
     NULL, send_ntp_request, NULL },
+  { "echo",
+    SOCK_DGRAM, 0, "echo",
+    NULL, send_udp_echo_request, validate_udp_echo_reply },
   { "dns",
     SOCK_DGRAM, 0, "domain",
-    NULL, send_dns_request, NULL },
+    NULL, send_dns_request, validate_dns_reply },
+  { "dns/tcp",
+    SOCK_STREAM, 0, "domain",
+    NULL, send_dns_request, validate_dns_reply },
   { "udp",
-    SOCK_DGRAM, IPPROTO_UDP, "echo",
+    SOCK_DGRAM, 0, "echo",
     NULL, send_udp_request, NULL },
   { NULL,
     -1, -1,
@@ -459,6 +707,7 @@ main(int argc,
   struct protocol *pp;
 
 
+  argv0 = argv[0];
   srandom(time(NULL)^getpid());
   f_ident = random();
 
@@ -472,9 +721,9 @@ main(int argc,
         puts("  -v            Be more verbose");
         puts("  -s            Be silent");
         puts("  -i            Ignore checksum errors");
-        puts("  -1            One-shot ping");
+        puts("  -1 / -2 / -3  One(two/three)-shot ping");
         puts("  -c            Continous ping");
-        puts("  -f            Flood ping");
+        puts("  -f            Flood ping (no delay)");
         puts("  -n            No DNS lookup");
         puts("  -d            Display response packet");
         puts("  -4            Force IPv4");
@@ -511,12 +760,14 @@ main(int argc,
         f_silent++;
         break;
       case '1':
-        f_cont = 1;
+      case '2':
+      case '3':
+        f_cont = argv[i][j]-'0';
         break;
       case 'c':
         f_cont = -1;
       case 'f':
-        f_ndelay++;
+        f_interval = 0;
         break;
       case 'n':
         f_numeric++;
@@ -654,7 +905,7 @@ main(int argc,
   }
 
   if (f_verbose)
-    printf("[p4ping, version %s - Copyright (c) 2023-2024 Peter Eriksson <pen@lysator.liu.se>]\n", version);
+    printf("[p4ping, version %s - Copyright (c) 2023-2025 Peter Eriksson <pen@lysator.liu.se>]\n", version);
 
  EndArg:
   if (i >= argc) {
@@ -675,6 +926,8 @@ main(int argc,
   pp = &protocols[j];
 
   pfdn = 0;
+
+  /* For each target specified on the command line */
   for (; i < argc; i++) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = f_family;
@@ -692,7 +945,7 @@ main(int argc,
       exit(1);
     }
 
-
+    /* For each target IP address found */
     for (rp = result; rp != NULL; rp = rp->ai_next) {
       int fd = -1;
 
@@ -839,6 +1092,7 @@ main(int argc,
   sigaction(SIGINT, &sa, NULL);
 
   seq = 0;
+  
   do {
     int na;
 
@@ -958,7 +1212,7 @@ main(int argc,
                       argv[0], hbuf);
               if (f_display) {
                 int offset = 0;
-                rc = display_buffer(rbuf+offset, rlen-offset);
+                rc = display_buffer(stderr, rbuf+offset, rlen-offset);
               }
             }
             continue;
@@ -971,13 +1225,14 @@ main(int argc,
 
             rc = pp->response(tp, seq, &t1, rbuf+offset, rlen-offset);
             if (rc) {
-              if (f_verbose > 1) {
+              if (f_verbose) {
                 fprintf(stderr, "%s: Error: %s: Invalid response: RC=%d\n",
                         argv[0], hbuf, rc);
                 if (f_display)
-                  rc = display_buffer(rbuf+offset, rlen-offset);
+                  rc = display_buffer(stderr, rbuf+offset, rlen-offset);
               }
-              continue;
+	      if (rc < 0)
+		continue;
             }
 	  }
 
@@ -992,18 +1247,21 @@ main(int argc,
 
           /* Print valid response */
           if (!f_silent) {
+	    FILE *outfp = (rc ? stderr : stdout);
 	    int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
 
-            print_timespec(&t1);
-            printf(" : %-*s : ", addrlen, tp->addr);
+            print_timespec(outfp, &t1);
+            fprintf(outfp, " : %-*s : ", addrlen, tp->addr);
             if (!f_numeric)
-              printf("%-*s : ", namelen, tp->name);
-            printf("seq=%u : rtt=%.3f ms", seq, rtt*1000);
+              fprintf(outfp, "%-*s : ", namelen, tp->name);
+            fprintf(outfp, "seq=%u : rtt=%.3f ms", seq, rtt*1000);
+	    if (rc)
+	      fprintf(outfp, " : rc=%d", rc);
             if (f_verbose)
-              printf(" : len=%d : missed=%lu", rlen-offset, tp->packets.missed);
-            putchar('\n');
+              fprintf(outfp, " : len=%d : missed=%lu", rlen-offset, tp->packets.missed);
+            putc('\n', outfp);
             if (f_display) {
-              rc = display_buffer(rbuf+offset, rlen-offset);
+              rc = display_buffer(outfp, rbuf+offset, rlen-offset);
             }
           }
           tp->packets.missed = 0;
@@ -1024,11 +1282,13 @@ main(int argc,
       if (tp->t1.tv_sec == 0 && tp->t1.tv_nsec == 0) {
         if (!f_silent || (tp->packets.missed >= f_warning ||
                           tp->packets.missed >= f_critical)) {
-          print_timespec(&t1);
-          printf(" : %-*s : ", addrlen, tp->addr);
+	  FILE *outfp = (tp->packets.missed >= f_critical ? stderr : stdout);
+
+          print_timespec(outfp, &t1);
+          fprintf(outfp, " : %-*s : ", addrlen, tp->addr);
           if (!f_numeric)
-            printf("%-*s : ", namelen, tp->name);
-          printf("seq=%u : missed=%lu : Timeout\n", seq, tp->packets.missed);
+            fprintf(outfp, "%-*s : ", namelen, tp->name);
+          fprintf(outfp, "seq=%u : missed=%lu : Timeout\n", seq, tp->packets.missed);
         }
         tp->packets.missed++;
       }
