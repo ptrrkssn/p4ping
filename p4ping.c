@@ -350,14 +350,25 @@ int
 send_ntp_request(struct target *tp,
                  unsigned int *seq) {
     struct ntp_header tbuf;
+    struct timespec tsb;
 
-  memset(&tbuf, 0, sizeof(tbuf));
+    memset(&tbuf, 0, sizeof(tbuf));
 
-  tbuf.li = 0;
-  tbuf.vn = 3;
-  tbuf.mode = 3;
+    tbuf.li = 0;
+    tbuf.vn = 3;
+    tbuf.mode = 3;
 
-  return sendto(tp->fd, (void *) &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+    clock_gettime(CLOCK_REALTIME, &tsb);
+    tbuf.transmit_timestamp.seconds = htonl(tsb.tv_sec+2208988800);
+    tbuf.transmit_timestamp.fraction = htonl(tsb.tv_nsec * 4294967296 / 1000000000);
+
+    return sendto(tp->fd, (void *) &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+
+double
+ntp_timestamp2double(struct ntp_timestamp *ntp) {
+    return htonl(ntp->seconds)-2208988800 + ntohl(ntp->fraction) / 4294967295.0;
 }
 
 
@@ -393,13 +404,15 @@ validate_ntp_reply(struct target *tp,
                    size_t buflen) {
     char refbuf[128], origin[128], receive[128], transmit[128];
     struct ntp_header *np = (struct ntp_header *) buf;
-
+    double delta;
 
     if (buflen < sizeof(*np))
         return -1;
 
+    delta = ntp_timestamp2double(&np->origin_timestamp)-ntp_timestamp2double(&np->transmit_timestamp);
+
     if (f_verbose)
-        fprintf(stderr, "NTP: li=%u, vn=%u, mode=%u, stratum=%u, poll=%u, precision=%u; root delay=%u, dispersion=%u, id=%u; reference=%s, origin=%s, receive=%s, transmit=%s\n",
+        fprintf(stderr, "NTP: li=%u, vn=%u, mode=%u, stratum=%u, poll=%u, precision=%u; root delay=%u, dispersion=%u, id=%u; reference=%s, origin=%s, receive=%s, transmit=%s; delta=%f\n",
                 np->li,
                 np->vn,
                 np->mode,
@@ -412,7 +425,8 @@ validate_ntp_reply(struct target *tp,
                 ntp_timestamp2str(refbuf, sizeof(refbuf), &np->reference_timestamp),
                 ntp_timestamp2str(origin, sizeof(origin), &np->origin_timestamp),
                 ntp_timestamp2str(receive, sizeof(receive), &np->receive_timestamp),
-                ntp_timestamp2str(transmit, sizeof(transmit), &np->transmit_timestamp));
+                ntp_timestamp2str(transmit, sizeof(transmit), &np->transmit_timestamp),
+                delta);
 
     return 0;
 }
