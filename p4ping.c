@@ -47,6 +47,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <arpa/nameser.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdatomic.h>
@@ -82,6 +83,7 @@ int f_display = 0;
 int f_warning = 1;
 int f_critical = 0;
 int f_syslog = -1;
+int f_dontfrag = 0;
 
 uint16_t f_ident = 0;
 char *f_payload = NULL;
@@ -221,6 +223,30 @@ struct icmp_echo {
   uint8_t payload[MAXBUFSIZE];
 };
 
+struct ntp_timestamp {
+    uint32_t seconds;
+    uint32_t fraction;
+} __attribute__((packed));
+
+struct ntp_header {
+    unsigned mode : 3;
+    unsigned vn : 3;
+    unsigned li : 2;
+
+    uint8_t stratum;
+    uint8_t poll;
+    uint8_t precision;
+
+    uint32_t root_delay;
+    uint32_t root_dispersion;
+    uint32_t reference_id;
+
+    struct ntp_timestamp reference_timestamp;
+    struct ntp_timestamp origin_timestamp;
+    struct ntp_timestamp receive_timestamp;
+    struct ntp_timestamp transmit_timestamp;
+} __attribute__((packed));
+
 
 unsigned int
 calc_checksum(unsigned char *buf,
@@ -323,12 +349,72 @@ validate_icmp_echo_reply(struct target *tp,
 int
 send_ntp_request(struct target *tp,
                  unsigned int *seq) {
-  unsigned char tbuf[48];
+    struct ntp_header tbuf;
 
-  memset(tbuf, 0, sizeof(tbuf));
-  tbuf[0] = 0x1B;
+  memset(&tbuf, 0, sizeof(tbuf));
 
-  return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+  tbuf.li = 0;
+  tbuf.vn = 3;
+  tbuf.mode = 3;
+
+  return sendto(tp->fd, (void *) &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+}
+
+
+char *
+ntp_timestamp2str(char *buf,
+                  size_t bufsize,
+                  struct ntp_timestamp *ntp) {
+    time_t bt;
+    struct tm *tmp;
+    int len;
+    double frac;
+    char *bp = buf;
+
+
+    bt = ntohl(ntp->seconds)-2208988800;
+    tmp = localtime(&bt);
+
+    strftime(bp, bufsize, "%Y-%m-%d %H:%M:%S", tmp);
+    len = strlen(bp);
+    bp += len;
+    bufsize -= len;
+
+    frac = ntohl(ntp->fraction) / 4294967295.0;
+    snprintf(bp, bufsize, "+%f", frac);
+    return buf;
+}
+
+int
+validate_ntp_reply(struct target *tp,
+                   unsigned int seq,
+                   struct timespec *t,
+                   void *buf,
+                   size_t buflen) {
+    char refbuf[128], origin[128], receive[128], transmit[128];
+    struct ntp_header *np = (struct ntp_header *) buf;
+
+
+    if (buflen < sizeof(*np))
+        return -1;
+
+    if (f_verbose)
+        fprintf(stderr, "NTP: li=%u, vn=%u, mode=%u, stratum=%u, poll=%u, precision=%u; root delay=%u, dispersion=%u, id=%u; reference=%s, origin=%s, receive=%s, transmit=%s\n",
+                np->li,
+                np->vn,
+                np->mode,
+                np->stratum,
+                np->poll,
+                np->precision,
+                ntohl(np->root_delay),
+                ntohl(np->root_dispersion),
+                ntohl(np->reference_id),
+                ntp_timestamp2str(refbuf, sizeof(refbuf), &np->reference_timestamp),
+                ntp_timestamp2str(origin, sizeof(origin), &np->origin_timestamp),
+                ntp_timestamp2str(receive, sizeof(receive), &np->receive_timestamp),
+                ntp_timestamp2str(transmit, sizeof(transmit), &np->transmit_timestamp));
+
+    return 0;
 }
 
 int
@@ -484,12 +570,36 @@ dns_unpack_labels(unsigned char *buf,
   return bufp-buf;
 }
 
+struct dns_mapping {
+    char *s;
+    int v;
+};
+
+struct dns_mapping dns_types[] = {
+    { "A", T_A },
+    { "AAAA", T_A },
+    { "SOA", T_SOA },
+    { "NS", T_NS },
+    { "TXT", T_TXT },
+    { "ANY", T_ANY },
+    { NULL, -1 }
+};
+
+struct dns_mapping dns_classes[] = {
+    { "IN", C_IN },
+    { "CH", C_CHAOS },
+    { "HS", C_HS },
+    { "NONE", C_NONE },
+    { "ANY", C_ANY },
+    { NULL, -1 }
+};
+
 int
 send_dns_udp_request(struct target *tp,
                      unsigned int *seq) {
   struct dns_request req;
   uint16_t xs = (*seq & 0xFFFF);
-  size_t len;
+  size_t len = 0;
 
 
   memset(&req, 0, sizeof(req));
@@ -498,19 +608,50 @@ send_dns_udp_request(struct target *tp,
 
   if (f_payload) {
     unsigned char *bufp;
+    char *cp, *ep;
+    int type = T_A, class = C_IN;
+    int i;
 
-    len = dns_pack_labels(f_payload, req.b, sizeof(req.b));
-    if (len < 0) {
-      fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
-	      argv0, f_payload);
-      exit(1);
+    for (cp = f_payload; cp; cp = ep) {
+        ep = strchr(cp, ' ');
+        if (ep)
+            *ep = '\0';
+
+        if (cp == f_payload) {
+            len = dns_pack_labels(cp, req.b, sizeof(req.b));
+            if (len < 0) {
+                fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
+                        argv0, cp);
+                exit(1);
+            }
+        } else {
+            for (i = 0; dns_types[i].s && strcasecmp(dns_types[i].s, cp); i++)
+                ;
+            if (dns_types[i].s)
+                type = dns_types[i].v;
+            else {
+                for (i = 0; dns_classes[i].s && strcasecmp(dns_classes[i].s, cp); i++)
+                    ;
+                if (dns_classes[i].s)
+                    class = dns_classes[i].v;
+                else {
+                    fprintf(stderr, "%s: Error: %s: Invalid DNS type/class\n", argv0, cp);
+                    exit(1);
+                }
+            }
+        }
+        if (ep) {
+            *ep = ' ';
+            while (*ep && isspace(*ep))
+                ++ep;
+        }
     }
 
     bufp = (unsigned char *) &req.b;
     bufp[len++] = 0;
-    bufp[len++] = 1; /* QTYPE:  1=A, 28=AAAA, 255=ANY */
+    bufp[len++] = type;
     bufp[len++] = 0;
-    bufp[len++] = 1; /* QCLASS: 1=IN, 255=ANY */
+    bufp[len++] = class;
 
     req.h.qdcount = htons(1);
 
@@ -780,7 +921,7 @@ struct protocol {
     NULL, send_icmp_echo_request, validate_icmp_echo_reply },
   { "ntp",
     SOCK_DGRAM, 0, "ntp",
-    NULL, send_ntp_request, NULL },
+    NULL, send_ntp_request, validate_ntp_reply },
   { "echo",
     SOCK_DGRAM, 0, "echo",
     NULL, send_udp_echo_request, validate_udp_echo_reply },
@@ -885,6 +1026,7 @@ main(int argc,
                 puts("  -f            Flood ping (no delay)");
                 puts("  -n            No DNS lookup");
                 puts("  -d            Display response packet");
+		puts("  -p            Enable PMTU (dont fragment packets)");
                 puts("  -4            Force IPv4");
                 puts("  -6            Force IPv6");
                 puts("  -t            Use TCP");
@@ -911,11 +1053,14 @@ main(int argc,
             case '6':
                 f_family = AF_INET6;
                 break;
+	    case 'p':
+	        f_dontfrag++;
+		break;
             case 't':
-                f_tcp = 1;
+                f_tcp++;
                 break;
             case 'u':
-                f_udp = 1;
+	        f_udp++;
                 break;
             case 'v':
                 f_verbose++;
@@ -1149,6 +1294,16 @@ main(int argc,
                     continue;
                 }
 
+                if (f_dontfrag) {
+		    int val = IP_PMTUDISC_DO;
+
+		    if (setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val)) < 0) {
+		        fprintf(stderr, "%s: Error: %s: setsockopt(IP_MTU_DISCOVER, %d): %s\n",
+				argv[0], argv[i], IP_PMTUDISC_DONT, strerror(errno));
+                        exit(1);
+                    }
+                }
+
                 if (0 && rp->ai_socktype == SOCK_STREAM) {
                     int one = 1;
 
@@ -1365,10 +1520,14 @@ main(int argc,
                 goto End;
 
             for (j = 0; j < np; j++) {
-                if (!pfdv[j].revents || !(pfdv[j].revents & POLLIN)) {
-                    fprintf(stderr, "fd=%d: Received non-POLLIN event\n", pfdv[j].fd);
-                    continue;
-                }
+	        if (!pfdv[j].revents)
+		    continue;
+
+		if (!(pfdv[j].revents & POLLIN)) {
+		    fprintf(stderr, "fd=%d: Received non-POLLIN event: %x\n", pfdv[j].fd,
+			    pfdv[j].revents);
+		    continue;
+		}
 
                 /* Clear out response sender address */
                 fromp = (struct sockaddr *) &frombuf;
