@@ -1,7 +1,7 @@
 /*
  * p4ping.c
  *
- * Copyright (c) 2023-2025 Peter Eriksson <pen@lysator.liu.se>
+ * Copyright (c) 2023-2026 Peter Eriksson <pen@lysator.liu.se>
  *
  * All rights reserved.
  *
@@ -59,6 +59,8 @@
 #endif
 #include <netinet/icmp6.h>
 
+#include "buffer.h"
+
 
 char *version = PACKAGE_VERSION;
 char *argv0 = "p4ping";
@@ -80,6 +82,7 @@ int f_numeric = 0;
 int f_silent = 0;
 int f_ttl = 0;
 int f_display = 0;
+int f_json = 0;
 int f_warning = 1;
 int f_critical = 0;
 int f_syslog = -1;
@@ -95,41 +98,60 @@ atomic_char got_sigint = 0;
 double
 diff_timespec(struct timespec *t0,
               struct timespec *t1) {
-  return (t0->tv_sec-t1->tv_sec) + (t0->tv_nsec-t1->tv_nsec)/1000000000.0;
+    return (t0->tv_sec-t1->tv_sec) + (t0->tv_nsec-t1->tv_nsec)/1000000000.0;
 }
+
+
+char *
+timespec2str(struct timespec *ts,
+             char *buf,
+             size_t bufsize) {
+    static char sbuf[256];
+    struct tm t;
+    int rc;
+
+
+    if (!buf) {
+        if (bufsize) {
+            buf = malloc(bufsize);
+            if (!buf)
+                return NULL;
+        } else {
+            buf = sbuf;
+            bufsize = sizeof(sbuf);
+        }
+    }
+
+    tzset();
+    if (localtime_r(&(ts->tv_sec), &t) == NULL)
+        return NULL;
+
+    rc = strftime(buf, bufsize, "%F %T", &t);
+    if (rc <= 0)
+        return NULL;
+
+    bufsize -= rc;
+
+    rc = snprintf(buf+rc, bufsize,
+                  (f_verbose ? ".%09ld" : ".%03ld"),
+                  f_verbose ? ts->tv_nsec : ts->tv_nsec/1000000);
+    if (rc >= bufsize)
+        return NULL;
+
+    return buf;
+}
+
 
 int
 print_timespec(FILE *fp,
 	       struct timespec *ts) {
-  char buf[64];
-  int rc;
-  struct tm t;
-  int len = sizeof(buf);
-
-
-  tzset();
-  if (localtime_r(&(ts->tv_sec), &t) == NULL)
-    return -1;
-
-  rc = strftime(buf, len, "%F %T", &t);
-  if (rc <= 0)
-    return -1;
-
-  len -= rc;
-
-  rc = snprintf(buf+strlen(buf), len,
-                (f_verbose ? ".%09ld" : ".%03ld"),
-                f_verbose ? ts->tv_nsec : ts->tv_nsec/1000000);
-  if (rc >= len)
-    return -1;
-
-  return fputs(buf, fp);
+    return fputs(timespec2str(ts, NULL, 0), fp);
 }
 
 
 void
 sigint_handler(int sig) {
-  got_sigint = 1;
+    got_sigint = 1;
 }
 
 void
@@ -141,66 +163,67 @@ int
 display_buffer(FILE *outfp,
 	       void *buf,
 	       size_t buflen) {
-  unsigned char *bufp = (unsigned char *) buf;
-  unsigned char *endp = bufp+buflen;
-  int i;
+    unsigned char *bufp = (unsigned char *) buf;
+    unsigned char *endp = bufp+buflen;
+    int i;
 
-  while (bufp < endp) {
-    putc(' ', outfp);
-    putc(' ', outfp);
-    putc(' ', outfp);
-    putc(' ', outfp);
-    for (i = 0; i < 16 && bufp+i < endp; i++) {
-      if (i > 0)
-	putc(' ', outfp);
-      if (i == 8)
-	putc(' ', outfp);
-      fprintf(outfp, "%02x", bufp[i]);
+    while (bufp < endp) {
+        putc(' ', outfp);
+        putc(' ', outfp);
+        putc(' ', outfp);
+        putc(' ', outfp);
+        for (i = 0; i < 16 && bufp+i < endp; i++) {
+            if (i > 0)
+                putc(' ', outfp);
+            if (i == 8)
+                putc(' ', outfp);
+            fprintf(outfp, "%02x", bufp[i]);
+        }
+        for (; i < 16; i++) {
+            if (i == 8)
+                putc(' ', outfp);
+            fputs("   ", outfp);
+        }
+
+        putc(' ', outfp);
+        putc(' ', outfp);
+        putc(' ', outfp);
+        putc(' ', outfp);
+        for (i = 0; i < 16 && bufp < endp; i++) {
+            if (i > 0)
+                putc(' ', outfp);
+            if (i == 8)
+                putc(' ', outfp);
+            putc(isprint(*bufp) ? *bufp : '?', outfp);
+            ++bufp;
+        }
+
+        putc('\n', outfp);
     }
-    for (; i < 16; i++) {
-      if (i == 8)
-	putc(' ', outfp);
-      fputs("   ", outfp);
-    }
 
-    putc(' ', outfp);
-    putc(' ', outfp);
-    putc(' ', outfp);
-    putc(' ', outfp);
-    for (i = 0; i < 16 && bufp < endp; i++) {
-      if (i > 0)
-	putc(' ', outfp);
-      if (i == 8)
-	putc(' ', outfp);
-      putc(isprint(*bufp) ? *bufp : '?', outfp);
-      ++bufp;
-    }
-
-    putc('\n', outfp);
-  }
-
-  return 0;
+    return 0;
 }
 
 
 
 typedef struct target {
-  int fd;
-  char *addr;
-  char *name;
-  struct addrinfo *ai;
-  struct timespec t0;
-  struct timespec t1;
-  struct {
-    unsigned long sent;
-    unsigned long missed;
-  } packets;
-  struct {
-    double min;
-    double max;
-    double sum;
-  } rtt;
-  struct target *next;
+    int fd;
+    char *addr;
+    char *name;
+    struct addrinfo *ai;
+    struct timespec t0;
+    struct timespec t1;
+    struct {
+        unsigned long sent;
+        unsigned long missed;
+    } packets;
+    struct {
+        double min;
+        double max;
+        double sum;
+    } rtt;
+    struct target *next;
+    BUFFER *buf;
 } TARGET;
 
 TARGET *tlist = NULL;
@@ -209,18 +232,18 @@ TARGET *tlist = NULL;
 
 
 struct icmp_echo_header {
-  uint8_t type;
-  uint8_t code;
-  uint16_t checksum;
-  uint16_t ident;
-  uint16_t seq;
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t ident;
+    uint16_t seq;
 };
 
 #define MAXBUFSIZE 16384
 
 struct icmp_echo {
-  struct icmp_echo_header header;
-  uint8_t payload[MAXBUFSIZE];
+    struct icmp_echo_header header;
+    uint8_t payload[MAXBUFSIZE];
 };
 
 struct ntp_timestamp {
@@ -251,57 +274,57 @@ struct ntp_header {
 unsigned int
 calc_checksum(unsigned char *buf,
               size_t buflen) {
-  uint32_t checksum = 0;
-  unsigned char* end = buf + buflen;
-  uint32_t carry;
+    uint32_t checksum = 0;
+    unsigned char* end = buf + buflen;
+    uint32_t carry;
 
-  if (buflen % 2 == 1) {
-    end = buf + buflen - 1;
-    checksum += (*end) << 8;
-  }
+    if (buflen % 2 == 1) {
+        end = buf + buflen - 1;
+        checksum += (*end) << 8;
+    }
 
-  while (buf < end) {
-    checksum += buf[0] << 8;
-    checksum += buf[1];
-    buf += 2;
-  }
+    while (buf < end) {
+        checksum += buf[0] << 8;
+        checksum += buf[1];
+        buf += 2;
+    }
 
-  carry = checksum >> 16;
-  while (carry) {
-    checksum = (checksum & 0xffff) + carry;
     carry = checksum >> 16;
-  }
+    while (carry) {
+        checksum = (checksum & 0xffff) + carry;
+        carry = checksum >> 16;
+    }
 
-  checksum = ~checksum;
-  return checksum & 0xffff;
+    checksum = ~checksum;
+    return checksum & 0xffff;
 }
 
 
 int
 send_icmp_echo_request(struct target *tp,
                        unsigned int *seq) {
-  struct icmp_echo ep;
-  size_t plen, eplen;
-  uint16_t xs = (*seq & 0xFFFF);
-  char *payload = f_payload ? f_payload : d_payload;
+    struct icmp_echo ep;
+    size_t plen, eplen;
+    uint16_t xs = (*seq & 0xFFFF);
+    char *payload = f_payload ? f_payload : d_payload;
 
 
-  plen = strlen(payload);
-  eplen = sizeof(struct icmp_echo_header)+plen;
+    plen = strlen(payload);
+    eplen = sizeof(struct icmp_echo_header)+plen;
 
-  memset(&ep, 0, sizeof(ep));
-  ep.header.type = (tp->ai->ai_family == AF_INET ? ICMP_ECHO : ICMP6_ECHO_REQUEST);
-  ep.header.code = 0;
-  ep.header.ident = htons(f_ident);
-  ep.header.seq = htons(xs);
+    memset(&ep, 0, sizeof(ep));
+    ep.header.type = (tp->ai->ai_family == AF_INET ? ICMP_ECHO : ICMP6_ECHO_REQUEST);
+    ep.header.code = 0;
+    ep.header.ident = htons(f_ident);
+    ep.header.seq = htons(xs);
 
-  memcpy(ep.payload, payload, plen);
+    memcpy(ep.payload, payload, plen);
 
-  /* The kernel automatically calculates the checksum for ICMPV6 */
-  if (tp->ai->ai_protocol == IPPROTO_ICMP)
-    ep.header.checksum = htons(calc_checksum((unsigned char *) &ep, eplen));
+    /* The kernel automatically calculates the checksum for ICMPV6 */
+    if (tp->ai->ai_protocol == IPPROTO_ICMP)
+        ep.header.checksum = htons(calc_checksum((unsigned char *) &ep, eplen));
 
-  return sendto(tp->fd, &ep, eplen, 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+    return sendto(tp->fd, &ep, eplen, 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 }
 
 int
@@ -310,41 +333,254 @@ validate_icmp_echo_reply(struct target *tp,
                          struct timespec *t,
                          void *buf,
                          size_t buflen) {
-  struct icmp_echo *er = (struct icmp_echo *) buf;
-  uint16_t checksum;
-  char *payload = f_payload ? f_payload : d_payload;
-  size_t erlen = sizeof(struct icmp_echo_header)+strlen(payload);
+    struct icmp_echo *er = (struct icmp_echo *) buf;
+    uint16_t checksum;
+    char *payload = f_payload ? f_payload : d_payload;
+    size_t erlen = sizeof(struct icmp_echo_header)+strlen(payload);
 
 
-  if (buflen < sizeof(struct icmp_echo_header))
-    return -1;
+    if (buflen < sizeof(struct icmp_echo_header))
+        return -1;
 
-  if (er->header.type != (tp->ai->ai_protocol == IPPROTO_ICMP ? ICMP_ECHOREPLY : ICMP6_ECHO_REPLY))
-    return -2; /* Not an ICMP Echo Reply Message */
+    if (er->header.type != (tp->ai->ai_protocol == IPPROTO_ICMP ? ICMP_ECHOREPLY : ICMP6_ECHO_REPLY))
+        return -2; /* Not an ICMP Echo Reply Message */
 
-  if (buflen != erlen)
-    return -3; /* Invalid packet length */
+    if (buflen != erlen)
+        return -3; /* Invalid packet length */
 
-  /* Only validate the checksum for IPv4 */
-  if (tp->ai->ai_protocol == IPPROTO_ICMP) {
-    checksum = ntohs(er->header.checksum);
-    er->header.checksum = 0;
-    if (checksum != calc_checksum((unsigned char *) er, erlen)) {
-      return -4; /* Invalid checksum */
+    /* Only validate the checksum for IPv4 */
+    if (tp->ai->ai_protocol == IPPROTO_ICMP) {
+        checksum = ntohs(er->header.checksum);
+        er->header.checksum = 0;
+        if (checksum != calc_checksum((unsigned char *) er, erlen)) {
+            return -4; /* Invalid checksum */
+        }
     }
-  }
 
-  if (ntohs(er->header.ident) != f_ident)
-    return -5; /* Invalid ident - not a response to our request */
+    if (ntohs(er->header.ident) != f_ident)
+        return -5; /* Invalid ident - not a response to our request */
 
-  if (ntohs(er->header.seq) != (seq & 0xFFFF))
-    return -6; /* Sequence number out of order */
+    if (ntohs(er->header.seq) != (seq & 0xFFFF))
+        return -6; /* Sequence number out of order */
 
-  if (memcmp(er->payload, payload, strlen(payload)) != 0)
-    return -7; /* Invalid payload content */
+    if (memcmp(er->payload, payload, strlen(payload)) != 0)
+        return -7; /* Invalid payload content */
 
-  return er->header.code;
+    return er->header.code;
 }
+
+
+int
+build_snmpv1_getrequest_descr(uint8_t *buf,
+                              size_t bufsize,
+                              char *community,
+                              uint8_t reqid) {
+    size_t i = 0;
+    size_t clen = strlen(community);
+
+    if (clen + 0x20 > bufsize)
+        return -1;
+
+    /* SEQUENCE */
+    buf[i++] = 0x30;
+    buf[i++] = 0x20 + clen;
+
+    /* VERSION */
+    buf[i++] = 0x02;
+    buf[i++] = 0x01;
+    buf[i++] = 0x00;
+
+    /* COMMUNITY */
+    buf[i++] = 0x04;
+    buf[i++] = clen;
+    while (clen-- > 0)
+        buf[i++] = *community++;
+
+    /* GET-REQUEST */
+    buf[i++] = 0xA0;
+    buf[i++] = 0x19;
+
+    /* Request-ID */
+    buf[i++] = 0x02;
+    buf[i++] = 0x01;
+    buf[i++] = reqid;
+
+    /* Error-Status */
+    buf[i++] = 0x02;
+    buf[i++] = 0x01;
+    buf[i++] = 0x00;
+
+    /* Error-Index */
+    buf[i++] = 0x02;
+    buf[i++] = 0x01;
+    buf[i++] = 0x00;
+
+    /* VarBind-List */
+    buf[i++] = 0x30;
+    buf[i++] = 0x0E;
+
+    /* VarBind */
+    buf[i++] = 0x30;
+    buf[i++] = 0x0C;
+
+    /* sysDescr.0 */
+    buf[i++] = 0x06;
+    buf[i++] = 0x08;
+    buf[i++] = 0x2B;
+    buf[i++] = 0x06;
+    buf[i++] = 0x01;
+    buf[i++] = 0x02;
+    buf[i++] = 0x01;
+    buf[i++] = 0x01;
+    buf[i++] = 0x01;
+    buf[i++] = 0x00;
+
+    /* NULL */
+    buf[i++] = 0x05;
+    buf[i++] = 0x00;
+
+    return i;
+}
+
+
+int
+send_snmpv1_request(struct target *tp,
+                    unsigned int *seq) {
+    uint8_t buf[512];
+    ssize_t buflen;
+
+    buflen = build_snmpv1_getrequest_descr(buf, sizeof(buf), (f_payload ? f_payload : "public"), (uint8_t) *seq);
+    if (buflen < 0)
+        return -1;
+
+    return sendto(tp->fd, (void *) buf, buflen, 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+
+}
+
+
+int
+validate_snmpv1_reply(struct target *tp,
+                      unsigned int seq,
+                      struct timespec *t,
+                      void *rbuf,
+                      size_t rbuflen) {
+    uint8_t *buf = (uint8_t *) rbuf;
+    size_t i = 0;
+    uint8_t sysdescr[512];
+
+
+    if (rbuflen < 20)
+        return -1;
+
+    /* Outer SEQUENCE */
+    if (buf[i++] != 0x30)
+        return -2;
+
+    /* Validate message length */
+    if (buf[i++]+2 > rbuflen)
+        return -3;
+
+    // version INTEGER
+    if (buf[i++] != 0x02)
+        return -4;
+    if (buf[i++] != 0x01)
+        return -5;
+    if (buf[i++] != 0x00)
+        return -6;  // SNMPv1
+
+    // community OCTET STRING
+    if (buf[i++] != 0x04)
+        return -7;
+    uint8_t comm_len = buf[i++];
+    i += comm_len;  // skip community
+
+    // PDU: GetResponse-PDU = A2
+    if (buf[i++] != 0xA2)
+        return -8;
+#if 1
+    i++;
+    #else
+    uint8_t pdu_len = buf[i++];
+    printf("pdu_len = %d\n", pdu_len);
+#endif
+
+    // request-id INTEGER
+    if (buf[i++] != 0x02)
+        return -9;
+    if (buf[i++] != 0x01)
+        return -10;
+    /* Validate the Sequence ID */
+    if (seq != buf[i++])
+        return -11;
+
+    // error-status INTEGER
+    if (buf[i++] != 0x02)
+        return -12;
+    if (buf[i++] != 0x01)
+        return -13;
+    uint8_t err_status = buf[i++];
+
+    // error-index INTEGER
+    if (buf[i++] != 0x02)
+        return -14;
+    if (buf[i++] != 0x01)
+        return -15;
+    uint8_t err_index = buf[i++];
+
+    if (err_status != 0 || err_index != 0)
+        return -16;  // not a successful response
+
+    // varbind-list SEQUENCE
+    if (buf[i++] != 0x30)
+        return -17;
+#if 1
+    i++;
+#else
+    uint8_t vbl_len = buf[i++];
+    printf("vbl_len = %d\n", vbl_len);
+#endif
+
+
+    // varbind SEQUENCE
+    if (buf[i++] != 0x30)
+        return -18;
+#if 1
+    i++;
+#else
+    uint8_t vb_len = buf[i++];
+    printf("vb_len = %d\n", vb_len);
+#endif
+
+    // OID
+    if (buf[i++] != 0x06)
+        return -19;
+
+    uint8_t oid_len = buf[i++];
+    if (oid_len != 8)
+        return -20;
+
+    // sysDescr.0 must be: 2B 06 01 02 01 01 01 00
+    if (memcmp(&buf[i], "\x2B\x06\x01\x02\x01\x01\x01\x00", 8) != 0)
+        return -21;
+    i += oid_len;
+
+    // Value: OCTET STRING
+    if (buf[i++] != 0x04)
+        return -22;
+
+    uint8_t val_len = buf[i++];
+    if (val_len >= sizeof(sysdescr))
+        return -1;
+
+    memcpy(sysdescr, &buf[i], val_len);
+    sysdescr[val_len] = '\0';
+
+    if (f_verbose)
+        fprintf(stderr, "SNMPv1: sysDescr=%s\n", sysdescr);
+
+    return 0;
+}
+
 
 int
 send_ntp_request(struct target *tp,
@@ -365,6 +601,14 @@ send_ntp_request(struct target *tp,
     return sendto(tp->fd, (void *) &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 }
 
+
+double
+timespec2double(struct timespec *tsp) {
+    double d;
+
+    d = tsp->tv_sec+(tsp->tv_nsec/1000000000.0);
+    return d;
+}
 
 double
 ntp_timestamp2double(struct ntp_timestamp *ntp) {
@@ -392,7 +636,7 @@ ntp_timestamp2str(char *buf,
     bufsize -= len;
 
     frac = ntohl(ntp->fraction) / 4294967295.0;
-    snprintf(bp, bufsize, "+%f", frac);
+    snprintf(bp, bufsize, "%+f", frac);
     return buf;
 }
 
@@ -412,7 +656,7 @@ validate_ntp_reply(struct target *tp,
     delta = ntp_timestamp2double(&np->origin_timestamp)-ntp_timestamp2double(&np->transmit_timestamp);
 
     if (f_verbose)
-        fprintf(stderr, "NTP: li=%u, vn=%u, mode=%u, stratum=%u, poll=%u, precision=%u; root delay=%u, dispersion=%u, id=%u; reference=%s, origin=%s, receive=%s, transmit=%s; delta=%f\n",
+        fprintf(stderr, "NTP: li=%u, vn=%u, mode=%u, stratum=%u, poll=%u, precision=%u; root delay=%u, dispersion=%u, id=%u; reference=%s, origin=%s, receive=%s, transmit=%s; delta=%+f\n",
                 np->li,
                 np->vn,
                 np->mode,
@@ -433,10 +677,10 @@ validate_ntp_reply(struct target *tp,
 
 int
 send_udp_echo_request(struct target *tp,
-                  unsigned int *seq) {
+                      unsigned int *seq) {
     unsigned int tbuf = htonl(*seq);
 
-  return sendto(tp->fd, &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+    return sendto(tp->fd, &tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 }
 
 int
@@ -458,22 +702,22 @@ validate_udp_echo_reply(struct target *tp,
 }
 
 struct dns_header {
-  uint16_t id;
+    uint16_t id;
 
-  unsigned rd     : 1;
-  unsigned tc     : 1;
-  unsigned aa     : 1;
-  unsigned opcode : 4;
-  unsigned qr     : 1;
+    unsigned rd     : 1;
+    unsigned tc     : 1;
+    unsigned aa     : 1;
+    unsigned opcode : 4;
+    unsigned qr     : 1;
 
-  unsigned rcode  : 4;
-  unsigned z      : 3;
-  unsigned ra     : 1;
+    unsigned rcode  : 4;
+    unsigned z      : 3;
+    unsigned ra     : 1;
 
-  uint16_t qdcount;
-  uint16_t ancount;
-  uint16_t nscount;
-  uint16_t arcount;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
 } __attribute__((packed));
 
 
@@ -493,52 +737,52 @@ size_t
 dns_pack_labels(char *name,
                 unsigned char *buf,
                 size_t bufsize) {
-  char *cp;
-  size_t tlen, plen;
+    char *cp;
+    size_t tlen, plen;
 
-  plen = 0;
-  while (*name) {
-    cp = strchr(name, '.');
-    tlen = cp ? cp-name : strlen(name);
-    if (tlen > 255)
-      return -1;
+    plen = 0;
+    while (*name) {
+        cp = strchr(name, '.');
+        tlen = cp ? cp-name : strlen(name);
+        if (tlen > 255)
+            return -1;
 
-    if (plen+1+tlen > bufsize)
-      return -1;
+        if (plen+1+tlen > bufsize)
+            return -1;
 
-    buf[plen++] = tlen;
-    memcpy(buf+plen, name, tlen);
-    plen += tlen;
+        buf[plen++] = tlen;
+        memcpy(buf+plen, name, tlen);
+        plen += tlen;
 
-    name += tlen + (cp ? 1 : 0);
-  }
+        name += tlen + (cp ? 1 : 0);
+    }
 
-  if (plen+1 > bufsize)
-    return -1;
-  buf[plen++] = 0;
+    if (plen+1 > bufsize)
+        return -1;
+    buf[plen++] = 0;
 
-  return plen;
+    return plen;
 }
 
 
 int
 dns_get_uint16(void *buf,
 	       size_t off) {
-  unsigned char *bufp = (unsigned char *) buf;
-  uint16_t rv;
+    unsigned char *bufp = (unsigned char *) buf;
+    uint16_t rv;
 
-  rv = * (uint16_t *) (bufp+off);
-  return rv;
+    rv = * (uint16_t *) (bufp+off);
+    return rv;
 }
 
 int
 dns_get_uint32(void *buf,
 	       size_t off) {
-  unsigned char *bufp = (unsigned char *) buf;
-  uint32_t rv;
+    unsigned char *bufp = (unsigned char *) buf;
+    uint32_t rv;
 
-  rv = * (uint32_t *) (bufp+off);
-  return rv;
+    rv = * (uint32_t *) (bufp+off);
+    return rv;
 }
 
 
@@ -547,41 +791,41 @@ dns_unpack_labels(unsigned char *buf,
 		  size_t pos,
 		  char *label,
 		  size_t size) {
-  unsigned char *bufp;
-  size_t len;
+    unsigned char *bufp;
+    size_t len;
 
 
-  bufp = buf+pos;
-  while ((len = *bufp++) > 0) {
-    if (len >= 64) {
-      len &= 63;
-      len <<= 8;
-      len += *bufp++;
-      dns_unpack_labels(buf, len, label, size);
-      return bufp-buf;
-    } else {
-      while (len-- > 0) {
-	if (size <= 0)
-	  return -1;
+    bufp = buf+pos;
+    while ((len = *bufp++) > 0) {
+        if (len >= 64) {
+            len &= 63;
+            len <<= 8;
+            len += *bufp++;
+            dns_unpack_labels(buf, len, label, size);
+            return bufp-buf;
+        } else {
+            while (len-- > 0) {
+                if (size <= 0)
+                    return -1;
 
-	*label++ = *bufp++;
-	--size;
-      }
+                *label++ = *bufp++;
+                --size;
+            }
+        }
+
+        if (size <= 0)
+            return -1;
+
+        *label++ = '.';
+        --size;
     }
 
     if (size <= 0)
-      return -1;
+        return -1;
 
-    *label++ = '.';
-    --size;
-  }
+    *label = '\0';
 
-  if (size <= 0)
-    return -1;
-
-  *label = '\0';
-
-  return bufp-buf;
+    return bufp-buf;
 }
 
 struct dns_mapping {
@@ -611,117 +855,117 @@ struct dns_mapping dns_classes[] = {
 int
 send_dns_udp_request(struct target *tp,
                      unsigned int *seq) {
-  struct dns_request req;
-  uint16_t xs = (*seq & 0xFFFF);
-  size_t len = 0;
+    struct dns_request req;
+    uint16_t xs = (*seq & 0xFFFF);
+    size_t len = 0;
 
 
-  memset(&req, 0, sizeof(req));
-  req.h.id = htons(xs&0xFFFF);
-  req.h.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
+    memset(&req, 0, sizeof(req));
+    req.h.id = htons(xs&0xFFFF);
+    req.h.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
 
-  if (f_payload) {
-    unsigned char *bufp;
-    char *cp, *ep;
-    int type = T_A, class = C_IN;
-    int i;
+    if (f_payload) {
+        unsigned char *bufp;
+        char *cp, *ep;
+        int type = T_A, class = C_IN;
+        int i;
 
-    for (cp = f_payload; cp; cp = ep) {
-        ep = strchr(cp, ' ');
-        if (ep)
-            *ep = '\0';
+        for (cp = f_payload; cp; cp = ep) {
+            ep = strchr(cp, ' ');
+            if (ep)
+                *ep = '\0';
 
-        if (cp == f_payload) {
-            len = dns_pack_labels(cp, req.b, sizeof(req.b));
-            if (len < 0) {
-                fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
-                        argv0, cp);
-                exit(1);
-            }
-        } else {
-            for (i = 0; dns_types[i].s && strcasecmp(dns_types[i].s, cp); i++)
-                ;
-            if (dns_types[i].s)
-                type = dns_types[i].v;
-            else {
-                for (i = 0; dns_classes[i].s && strcasecmp(dns_classes[i].s, cp); i++)
-                    ;
-                if (dns_classes[i].s)
-                    class = dns_classes[i].v;
-                else {
-                    fprintf(stderr, "%s: Error: %s: Invalid DNS type/class\n", argv0, cp);
+            if (cp == f_payload) {
+                len = dns_pack_labels(cp, req.b, sizeof(req.b));
+                if (len < 0) {
+                    fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
+                            argv0, cp);
                     exit(1);
                 }
+            } else {
+                for (i = 0; dns_types[i].s && strcasecmp(dns_types[i].s, cp); i++)
+                    ;
+                if (dns_types[i].s)
+                    type = dns_types[i].v;
+                else {
+                    for (i = 0; dns_classes[i].s && strcasecmp(dns_classes[i].s, cp); i++)
+                        ;
+                    if (dns_classes[i].s)
+                        class = dns_classes[i].v;
+                    else {
+                        fprintf(stderr, "%s: Error: %s: Invalid DNS type/class\n", argv0, cp);
+                        exit(1);
+                    }
+                }
+            }
+            if (ep) {
+                *ep = ' ';
+                while (*ep && isspace(*ep))
+                    ++ep;
             }
         }
-        if (ep) {
-            *ep = ' ';
-            while (*ep && isspace(*ep))
-                ++ep;
-        }
-    }
 
-    bufp = (unsigned char *) &req.b;
-    bufp[len++] = 0;
-    bufp[len++] = type;
-    bufp[len++] = 0;
-    bufp[len++] = class;
+        bufp = (unsigned char *) &req.b;
+        bufp[len++] = 0;
+        bufp[len++] = type;
+        bufp[len++] = 0;
+        bufp[len++] = class;
 
-    req.h.qdcount = htons(1);
+        req.h.qdcount = htons(1);
 
-  } else
-      len = 0;
+    } else
+        len = 0;
 
-  return send(tp->fd, (void *) &req, sizeof(req.h)+len, 0);
+    return send(tp->fd, (void *) &req, sizeof(req.h)+len, 0);
 }
 
 int
 send_dns_tcp_request(struct target *tp,
                      unsigned int *seq) {
-  struct dns_request req;
-  uint16_t reqsize;
-  uint16_t xs = (*seq & 0xFFFF);
-  size_t len;
-  struct msghdr msg;
-  struct iovec iov[2];
+    struct dns_request req;
+    uint16_t reqsize;
+    uint16_t xs = (*seq & 0xFFFF);
+    size_t len;
+    struct msghdr msg;
+    struct iovec iov[2];
 
-  memset(&req, 0, sizeof(req));
-  req.h.id = htons(xs&0xFFFF);
-  req.h.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
+    memset(&req, 0, sizeof(req));
+    req.h.id = htons(xs&0xFFFF);
+    req.h.opcode = 0; /* 0 = Query, 1 = Inverse Query, 2 = Server status */
 
-  if (f_payload) {
-    unsigned char *bufp;
+    if (f_payload) {
+        unsigned char *bufp;
 
-    len = dns_pack_labels(f_payload, req.b, sizeof(req.b));
-    if (len < 0) {
-      fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
-	      argv0, f_payload);
-      exit(1);
-    }
+        len = dns_pack_labels(f_payload, req.b, sizeof(req.b));
+        if (len < 0) {
+            fprintf(stderr, "%s: Error: %s: Invalid DNS name\n",
+                    argv0, f_payload);
+            exit(1);
+        }
 
-    bufp = (unsigned char *) &req.b;
-    bufp[len++] = 0;
-    bufp[len++] = 1; /* QTYPE = A */
-    bufp[len++] = 0;
-    bufp[len++] = 1; /* QCLASS = IN */
+        bufp = (unsigned char *) &req.b;
+        bufp[len++] = 0;
+        bufp[len++] = 1; /* QTYPE = A */
+        bufp[len++] = 0;
+        bufp[len++] = 1; /* QCLASS = IN */
 
-    req.h.qdcount = htons(1);
+        req.h.qdcount = htons(1);
 
-  } else
-      len = 0;
+    } else
+        len = 0;
 
-  reqsize = htons(sizeof(req.h)+len);
+    reqsize = htons(sizeof(req.h)+len);
 
-  iov[0].iov_base = &reqsize;
-  iov[0].iov_len = sizeof(reqsize);
-  iov[1].iov_base = &req;
-  iov[1].iov_len = reqsize;
+    iov[0].iov_base = &reqsize;
+    iov[0].iov_len = sizeof(reqsize);
+    iov[1].iov_base = &req;
+    iov[1].iov_len = reqsize;
 
-  memset(&msg, 0, sizeof(msg));
-  msg.msg_iov = &iov[0];
-  msg.msg_iovlen = 2;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov[0];
+    msg.msg_iovlen = 2;
 
-  return sendmsg(tp->fd, (void *) &msg, 0);
+    return sendmsg(tp->fd, (void *) &msg, 0);
 }
 
 
@@ -910,87 +1154,90 @@ validate_dns_tcp_reply(struct target *tp,
 int
 send_udp_request(struct target *tp,
                  unsigned int *seq) {
-  unsigned char tbuf[512];
+    unsigned char tbuf[512];
 
-  memset(tbuf, 0, sizeof(tbuf));
+    memset(tbuf, 0, sizeof(tbuf));
 #if 1
-  return send(tp->fd, tbuf, sizeof(tbuf), 0);
+    return send(tp->fd, tbuf, sizeof(tbuf), 0);
 #else
-  return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
+    return sendto(tp->fd, tbuf, sizeof(tbuf), 0, tp->ai->ai_addr, tp->ai->ai_addrlen);
 #endif
 }
 
 
 struct protocol {
-  char *name;
-  int ai_socktype;
-  int ai_protocol;
-  char *ai_service;
-  int (*setup)(struct addrinfo *aip);
-  int (*request)(struct target *tp, unsigned int *seq);
-  int (*response)(struct target *tp, unsigned int seq, struct timespec *t0, void *buf, size_t buflen);
+    char *name;
+    int ai_socktype;
+    int ai_protocol;
+    char *ai_service;
+    int (*setup)(struct addrinfo *aip);
+    int (*request)(struct target *tp, unsigned int *seq);
+    int (*response)(struct target *tp, unsigned int seq, struct timespec *t0, void *buf, size_t buflen);
 } protocols[] = {
-  { "icmp",
-    SOCK_RAW, IPPROTO_ICMP, NULL,
-    NULL, send_icmp_echo_request, validate_icmp_echo_reply },
-  { "ntp",
-    SOCK_DGRAM, 0, "ntp",
-    NULL, send_ntp_request, validate_ntp_reply },
-  { "echo",
-    SOCK_DGRAM, 0, "echo",
-    NULL, send_udp_echo_request, validate_udp_echo_reply },
-  { "dns/udp",
-    SOCK_DGRAM, 0, "domain",
-    NULL, send_dns_udp_request, validate_dns_udp_reply },
-  { "dns/tcp",
-    SOCK_STREAM, 0, "domain",
-    NULL, send_dns_tcp_request, validate_dns_tcp_reply },
-  { "udp",
-    SOCK_DGRAM, 0, "echo",
-    NULL, send_udp_request, NULL },
-  { NULL,
-    -1, -1,
-    NULL, NULL, NULL }
+    { "icmp",
+      SOCK_RAW, IPPROTO_ICMP, NULL,
+      NULL, send_icmp_echo_request, validate_icmp_echo_reply },
+    { "ntp",
+      SOCK_DGRAM, 0, "ntp",
+      NULL, send_ntp_request, validate_ntp_reply },
+    { "echo",
+      SOCK_DGRAM, 0, "echo",
+      NULL, send_udp_echo_request, validate_udp_echo_reply },
+    { "dns/udp",
+      SOCK_DGRAM, 0, "domain",
+      NULL, send_dns_udp_request, validate_dns_udp_reply },
+    { "dns/tcp",
+      SOCK_STREAM, 0, "domain",
+      NULL, send_dns_tcp_request, validate_dns_tcp_reply },
+    { "udp",
+      SOCK_DGRAM, 0, "echo",
+      NULL, send_udp_request, NULL },
+    { "snmp",
+      SOCK_DGRAM, 0, "snmp",
+      NULL, send_snmpv1_request, validate_snmpv1_reply },
+    { NULL,
+      -1, -1,
+      NULL, NULL, NULL }
 };
 
 
 struct syslog_fac {
-  char *name;
-  int fac;
+    char *name;
+    int fac;
 } logfacv[] = {
-  { "auth", LOG_AUTH },
-  { "authpriv", LOG_AUTHPRIV },
-  { "cron", LOG_CRON },
-  { "daemon", LOG_DAEMON },
-  { "ftp", LOG_FTP },
-  { "local0", LOG_LOCAL0 },
-  { "local1", LOG_LOCAL1 },
-  { "local2", LOG_LOCAL2 },
-  { "local3", LOG_LOCAL3 },
-  { "local4", LOG_LOCAL4 },
-  { "local5", LOG_LOCAL5 },
-  { "local6", LOG_LOCAL6 },
-  { "local7", LOG_LOCAL7 },
-  { "lpr", LOG_LPR },
-  { "mail", LOG_MAIL },
-  { "news", LOG_NEWS },
-  { "user", LOG_USER },
-  { "uucp", LOG_UUCP },
-  { NULL, -1 }
+    { "auth", LOG_AUTH },
+    { "authpriv", LOG_AUTHPRIV },
+    { "cron", LOG_CRON },
+    { "daemon", LOG_DAEMON },
+    { "ftp", LOG_FTP },
+    { "local0", LOG_LOCAL0 },
+    { "local1", LOG_LOCAL1 },
+    { "local2", LOG_LOCAL2 },
+    { "local3", LOG_LOCAL3 },
+    { "local4", LOG_LOCAL4 },
+    { "local5", LOG_LOCAL5 },
+    { "local6", LOG_LOCAL6 },
+    { "local7", LOG_LOCAL7 },
+    { "lpr", LOG_LPR },
+    { "mail", LOG_MAIL },
+    { "news", LOG_NEWS },
+    { "user", LOG_USER },
+    { "uucp", LOG_UUCP },
+    { NULL, -1 }
 };
 
 int
 str2fac(const char *str,
         int *fac) {
-  int i;
+    int i;
 
-  for (i = 0; logfacv[i].name && strcmp(logfacv[i].name, str) != 0; i++)
-    ;
+    for (i = 0; logfacv[i].name && strcmp(logfacv[i].name, str) != 0; i++)
+        ;
 
-  if (fac)
-    *fac = logfacv[i].fac;
+    if (fac)
+        *fac = logfacv[i].fac;
 
-  return logfacv[i].fac;
+    return logfacv[i].fac;
 }
 
 
@@ -1033,6 +1280,7 @@ main(int argc,
                 puts("\nOptions:");
                 puts("  -h            Display this information");
                 puts("  -v            Be more verbose");
+                puts("  -j            Output results in JSON format");
                 puts("  -s            Be silent");
                 puts("  -i            Ignore errors");
                 puts("  -1 / -2 / -3  One(two/three)-shot ping");
@@ -1066,6 +1314,9 @@ main(int argc,
                 break;
             case '6':
                 f_family = AF_INET6;
+                break;
+            case 'j':
+                f_json++;
                 break;
 	    case 'p':
 	        f_dontfrag++;
@@ -1232,7 +1483,7 @@ main(int argc,
     }
 
     if (f_verbose)
-        printf("[p4ping, version %s - Copyright (c) 2023-2025 Peter Eriksson <pen@lysator.liu.se>]\n", version);
+        printf("[p4ping, version %s - Copyright (c) 2023-2026 Peter Eriksson <pen@lysator.liu.se>]\n", version);
 
  EndArg:
     if (i >= argc) {
@@ -1393,6 +1644,8 @@ main(int argc,
 
             tp->fd = fd;
             tp->ai = rp;
+
+            tp->buf = buffer_new(16384);
 
             rc = getnameinfo(rp->ai_addr, rp->ai_addrlen,
                              hbuf, sizeof(hbuf),
@@ -1626,18 +1879,28 @@ main(int argc,
                     FILE *outfp = (rc ? stderr : stdout);
                     int offset = (tp->ai->ai_protocol == IPPROTO_ICMP && rlen > 20 ? 20 : 0);
 
-                    print_timespec(outfp, &t1);
-                    fprintf(outfp, " : %-*s : ", addrlen, tp->addr);
-                    if (!f_numeric)
-                        fprintf(outfp, "%-*s : ", namelen, tp->name);
-                    fprintf(outfp, "seq=%u : rtt=%.3f ms", seq, rtt*1000);
-                    if (rc)
-                        fprintf(outfp, " : rc=%d", rc);
-                    if (f_verbose)
-                        fprintf(outfp, " : len=%d", rlen-offset);
-                    putc('\n', outfp);
-                    if (f_display) {
-                        rc = display_buffer(outfp, rbuf+offset, rlen-offset);
+                    if (f_json) {
+                        printf("\"%s\":{\n", timespec2str(&t1, NULL, 0));
+                        printf("  \"seq\": %u,\n", seq);
+                        printf("  \"addr\": \"%*s\",\n", addrlen, tp->addr);
+                        printf("  \"name\": \"%*s\",\n", namelen, tp->name);
+                        printf("  \"status\": \"valid\",\n");
+                        printf("  \"rtt_us\": %.3f\n", rtt*1000000.0);
+                        printf("},\n");
+                    } else {
+                        print_timespec(outfp, &t1);
+                        fprintf(outfp, " : %-*s : ", addrlen, tp->addr);
+                        if (!f_numeric)
+                            fprintf(outfp, "%-*s : ", namelen, tp->name);
+                        fprintf(outfp, "seq=%u : rtt=%.3f ms", seq, rtt*1000);
+                        if (rc)
+                            fprintf(outfp, " : rc=%d", rc);
+                        if (f_verbose)
+                            fprintf(outfp, " : len=%d", rlen-offset);
+                        putc('\n', outfp);
+                        if (f_display) {
+                            rc = display_buffer(outfp, rbuf+offset, rlen-offset);
+                        }
                     }
                 }
                 /*          tp->packets.missed = 0; */
@@ -1659,11 +1922,20 @@ main(int argc,
                                   tp->packets.missed >= f_critical)) {
                     FILE *outfp = (tp->packets.missed >= f_critical ? stderr : stdout);
 
-                    print_timespec(outfp, &t1);
-                    fprintf(outfp, " : %-*s : ", addrlen, tp->addr);
-                    if (!f_numeric)
-                        fprintf(outfp, "%-*s : ", namelen, tp->name);
-                    fprintf(outfp, "seq=%u : Timeout (%lu missed)\n", seq, tp->packets.missed);
+                    if (f_json) {
+                        printf("\"%s\":{\n", timespec2str(&t1, NULL, 0));
+                        printf("  \"seq\": %u,", seq);
+                        printf("  \"addr\": \"%*s\",", addrlen, tp->addr);
+                        printf("  \"name\": \"%*s\",", namelen, tp->name);
+                        printf("  \"status\": \"missed\",");
+                        printf("},\n");
+                    } else {
+                        print_timespec(outfp, &t1);
+                        fprintf(outfp, " : %-*s : ", addrlen, tp->addr);
+                        if (!f_numeric)
+                            fprintf(outfp, "%-*s : ", namelen, tp->name);
+                        fprintf(outfp, "seq=%u : Timeout (%lu missed)\n", seq, tp->packets.missed);
+                    }
                     if (!f_ignore)
                         exit(1);
                 }
@@ -1688,7 +1960,7 @@ main(int argc,
         ++seq;
     } while (!got_sigint && f_cont);
 
-    if (f_summary || f_verbose) {
+    if (f_summary || f_verbose || f_json) {
         unsigned long sent = 0;
         unsigned long missed = 0;
         double rtt_min = -1;
@@ -1710,9 +1982,27 @@ main(int argc,
 
         rtt_avg /= (sent-missed);
 
-        printf("[packets: %lu sent, %lu received, %.0f%% packet loss; ",
-               sent, sent-missed, (missed*100.0/sent));
-        printf("rtt(ms): %.3f min, %.3f avg, %.3f max]\n",
-               rtt_min*1000.0, rtt_avg*1000.0, rtt_max*1000.0);
+        if (f_json) {
+            printf("\"summary\":{\n");
+            printf("  \"packets\":{\n");
+            printf("    \"sent\": %lu,\n", sent);
+            printf("    \"received\": %lu,\n", sent-missed);
+            printf("    \"missed\": %lu,\n", missed);
+            printf("    \"loss_pct\": %.0f\n", (missed*100.0/sent));
+            printf("  },\n");
+            printf("  \"rtt\":{\n");
+            printf("    \"min_us\": %.3f,\n", rtt_min*1000000.0);
+            printf("    \"avg_us\": %.3f,\n", rtt_avg*1000000.0);
+            printf("    \"max_us\": %.3f,\n", rtt_max*1000000.0);
+            printf("  }\n");
+            printf("}\n");
+        } else {
+            printf("[packets: %lu sent, %lu received, %.0f%% packet loss; ",
+                   sent, sent-missed, (missed*100.0/sent));
+            printf("rtt(ms): %.3f min, %.3f avg, %.3f max]\n",
+                   rtt_min*1000.0, rtt_avg*1000.0, rtt_max*1000.0);
+        }
     }
+
+    return 0;
 }

@@ -45,13 +45,14 @@ DISTCHECKDIR =		/tmp/distcheck-$(PACKAGE)-$(VERSION)
 DISTDIR =		/tmp/build-$(PACKAGE)-$(VERSION)
 
 PROGRAMS =		p4ping
-OBJS =			p4ping.o
+OBJS =			p4ping.o buffer.o
 
 
 
 all: $(PROGRAMS)
 
-p4ping.o:	p4ping.c Makefile config.h
+p4ping.o:	p4ping.c buffer.h Makefile config.h
+buffer.o:	buffer.c buffer.h Makefile config.h
 
 p4ping: $(OBJS)
 	$(CC) $(LDFLAGS) -o p4ping $(OBJS) $(LIBS)
@@ -121,4 +122,3 @@ $(PACKAGE)-$(VERSION).tar.gz: p4ping
 	echo rm -fr "$(DISTDIR)"
 	@echo ""
 	@echo "*** $(PACKAGE)-$(VERSION).tar.gz created"
-
