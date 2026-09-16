@@ -45,14 +45,22 @@ DISTCHECKDIR =		/tmp/distcheck-$(PACKAGE)-$(VERSION)
 DISTDIR =		/tmp/build-$(PACKAGE)-$(VERSION)
 
 PROGRAMS =		p4ping
-OBJS =			p4ping.o buffer.o
+OBJS =			p4ping.o buffer.o icmp.o ntp.o dns.o krb.o snmp.o
 
 
 
 all: $(PROGRAMS)
 
-p4ping.o:	p4ping.c buffer.h Makefile config.h
+p4ping.h:       buffer.h
+
+p4ping.o:	p4ping.c p4ping.h Makefile config.h buffer.h snmp.h
 buffer.o:	buffer.c buffer.h Makefile config.h
+icmp.o:		icmp.c icmp.h Makefile config.h
+ntp.o:		ntp.c ntp.h Makefile config.h
+dns.o:		dns.c dns.h Makefile config.h
+krb.o:		krb.c krb.h Makefile config.h
+snmp.o:		snmp.c snmp.h Makefile config.h
+
 
 p4ping: $(OBJS)
 	$(CC) $(LDFLAGS) -o p4ping $(OBJS) $(LIBS)
